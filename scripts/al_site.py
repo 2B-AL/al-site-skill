@@ -25,6 +25,7 @@ import threading
 
 
 DEFAULT_LOGIN_CALLBACK_URL = "http://127.0.0.1:8766/oauth/callback"
+DEFAULT_GATEWAY_URL = "https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com"
 STATE_DIR = pathlib.Path(os.environ.get("AL_SITE_STATE_DIR", "~/.al-site-mcp")).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
 
@@ -91,10 +92,7 @@ def configured_gateway_url():
     if not value:
         value = str(load_state().get("gateway_url") or "").strip()
     if not value:
-        raise SystemExit(
-            "Site MCP Gateway is not configured; run: "
-            "python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>"
-        )
+        value = DEFAULT_GATEWAY_URL
     return validate_gateway_url(value)
 
 
@@ -1091,7 +1089,7 @@ def main():
     if args.action == "config":
         state = load_state()
         print_json({
-            "gateway_url": os.environ.get("AL_SITE_MCP_GATEWAY_URL") or state.get("gateway_url", ""),
+            "gateway_url": os.environ.get("AL_SITE_MCP_GATEWAY_URL") or state.get("gateway_url") or DEFAULT_GATEWAY_URL,
             "conversation_id": os.environ.get("AL_SITE_CONVERSATION_ID") or state.get("conversation_id", ""),
             "site_id": os.environ.get("AL_SITE_ID") or state.get("site_id", ""),
             "has_valid_token": bool(cached_token()),

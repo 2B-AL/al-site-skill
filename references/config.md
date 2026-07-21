@@ -1,6 +1,12 @@
 # 配置
 
-当前没有内置默认 Gateway。设置一次：
+dev 环境内置默认 Gateway：
+
+```text
+https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com
+```
+
+切换其他环境时设置一次：
 
 ```bash
 python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>

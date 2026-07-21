@@ -32,6 +32,12 @@ class SiteClientTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             al_site.validate_gateway_url("https://gateway.example/not-mcp")
 
+    def test_dev_gateway_is_the_default(self):
+        with mock.patch.dict(os.environ, {"AL_SITE_MCP_GATEWAY_URL": ""}), mock.patch.object(
+            al_site, "load_state", return_value={}
+        ):
+            self.assertEqual(al_site.DEFAULT_GATEWAY_URL, al_site.configured_gateway_url())
+
     def test_argument_merge_parses_json(self):
         value = al_site.merge_call_arguments('{"site_id":"a"}', ["confirm=true", "step=2", 'users=["u"]'])
         self.assertEqual({"site_id": "a", "confirm": True, "step": 2, "users": ["u"]}, value)

@@ -9,14 +9,20 @@ description: Use when deploying local code or operating persistent AL Sites thro
 
 ## 开始前
 
-dev 环境尚未为 Site MCP 分配并启用独立公网 Gateway，因此当前没有可安全内置的默认地址。首次使用先配置实际 Gateway：
+dev 环境默认使用独立的 Site MCP 公网 Gateway：
+
+```text
+https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com
+```
+
+如需切换其他环境，可以持久化配置实际 Gateway：
 
 ```bash
 python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>
 python3 scripts/al_site.py login
 ```
 
-也可以只对当前进程设置：
+也可以只对当前进程覆盖：
 
 ```bash
 export AL_SITE_MCP_GATEWAY_URL=https://<site-mcp-public-host>

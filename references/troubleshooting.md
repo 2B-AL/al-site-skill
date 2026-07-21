@@ -1,8 +1,8 @@
 # 排障
 
-## Site MCP Gateway is not configured
+## 切换 Site MCP Gateway
 
-当前 dev 不内置默认域名。配置独立 Site MCP Gateway：
+当前 dev 已内置独立 Site MCP Gateway。只有使用其他环境或显式清空/覆盖配置时，才需要配置 Gateway：
 
 ```bash
 python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>
