@@ -18,7 +18,7 @@ EXPECTED_TOOLS = {
 
 
 def run(arguments):
-    script = pathlib.Path(__file__).with_name("al_site.py")
+    script = pathlib.Path(__file__).with_name("al_mcp.py")
     completed = subprocess.run(
         [sys.executable, str(script), *arguments], text=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,

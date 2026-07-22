@@ -10,13 +10,19 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "al_site.py"
+SCRIPT = pathlib.Path(__file__).parents[1] / "scripts" / "al_mcp.py"
 SPEC = importlib.util.spec_from_file_location("al_site", SCRIPT)
 al_site = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(al_site)
 
 
 class SiteClientTest(unittest.TestCase):
+    def test_repository_uses_pure_mcp_client_layout(self):
+        root = pathlib.Path(__file__).parents[1]
+        self.assertTrue((root / "scripts" / "al_mcp.py").is_file())
+        self.assertFalse((root / "scripts" / "al_site.py").exists())
+        self.assertFalse((root / "agents" / "openai.yaml").exists())
+
     def test_all_current_tools_have_unique_commands(self):
         commands = [al_site.tool_command_name(name) for name in al_site.SITE_TOOLS]
         self.assertEqual(len(commands), len(set(commands)))

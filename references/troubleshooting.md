@@ -5,7 +5,7 @@
 当前 dev 已内置独立 Site MCP Gateway。只有使用其他环境或显式清空/覆盖配置时，才需要配置 Gateway：
 
 ```bash
-python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>
+python3 scripts/al_mcp.py configure --gateway-url https://<site-mcp-public-host>
 ```
 
 Site Access Gateway 和用户 Site URL 不能替代 MCP Gateway。
@@ -31,8 +31,8 @@ export AL_SITE_CONVERSATION_ID=<uuid>
 ## 没有当前 Site
 
 ```bash
-python3 scripts/al_site.py sites
-python3 scripts/al_site.py select SITE_ID
+python3 scripts/al_mcp.py sites
+python3 scripts/al_mcp.py select SITE_ID
 ```
 
 `archive` 后 Site 仍然存在，只是 conversation 不再选择它。
@@ -44,7 +44,7 @@ python3 scripts/al_site.py select SITE_ID
 如果目标就是发布当前工作区内容，改用：
 
 ```bash
-python3 scripts/al_site.py save-local . --site-id SITE_ID
+python3 scripts/al_mcp.py save-local . --site-id SITE_ID
 ```
 
 ## high-confidence credential material detected
@@ -98,11 +98,11 @@ USER 65532:65532
 ## 版本或部署一直未 Ready
 
 ```bash
-python3 scripts/al_site.py wait-version VERSION_ID --site-id SITE_ID
-python3 scripts/al_site.py get-site-version-logs \
+python3 scripts/al_mcp.py wait-version VERSION_ID --site-id SITE_ID
+python3 scripts/al_mcp.py get-site-version-logs \
   --arg site_id=SITE_ID --arg version_id=VERSION_ID --arg stage=build --arg tail_lines=200
-python3 scripts/al_site.py get-site-events --arg site_id=SITE_ID
-python3 scripts/al_site.py deployment DEPLOYMENT_ID --site-id SITE_ID
+python3 scripts/al_mcp.py get-site-events --arg site_id=SITE_ID
+python3 scripts/al_mcp.py deployment DEPLOYMENT_ID --site-id SITE_ID
 ```
 
 `wait-version` 使用带 cursor 的长轮询；即使没有状态变化也会周期性返回 heartbeat，而不是让 Agent 盲等。失败时使用 owner-scoped 的 `GetSiteVersionLogs`，不接受调用方提供 namespace/Pod/container。以返回的 `phase`、stage、attempt、conditions、错误 code 和真实 URL 为准，不用 Pod Ready 或客户端 HTTP timeout 代替业务状态。

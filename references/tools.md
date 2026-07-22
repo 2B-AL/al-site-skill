@@ -17,16 +17,16 @@
 ## 动态发现与通用调用
 
 ```bash
-python3 scripts/al_site.py tools --names
-python3 scripts/al_site.py describe PromoteSiteDeployment
-python3 scripts/al_site.py call PromoteSiteDeployment --arguments @promote.json
-python3 scripts/al_site.py promote-site-deployment --arguments @promote.json
+python3 scripts/al_mcp.py tools --names
+python3 scripts/al_mcp.py describe PromoteSiteDeployment
+python3 scripts/al_mcp.py call PromoteSiteDeployment --arguments @promote.json
+python3 scripts/al_mcp.py promote-site-deployment --arguments @promote.json
 ```
 
 `--arguments` 必须是 JSON object。`--arg` 可重复并覆盖同名字段：
 
 ```bash
-python3 scripts/al_site.py set-site-access-policy \
+python3 scripts/al_mcp.py set-site-access-policy \
   --arg site_id=my-site \
   --arg audience=selected \
   --arg 'users=["user-1"]'

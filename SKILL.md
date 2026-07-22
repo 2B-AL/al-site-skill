@@ -18,8 +18,8 @@ https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com
 如需切换其他环境，可以持久化配置实际 Gateway：
 
 ```bash
-python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>
-python3 scripts/al_site.py login
+python3 scripts/al_mcp.py configure --gateway-url https://<site-mcp-public-host>
+python3 scripts/al_mcp.py login
 ```
 
 也可以只对当前进程覆盖：
@@ -43,20 +43,20 @@ export AL_SITE_MCP_GATEWAY_URL=https://<site-mcp-public-host>
 MCP Server 的 `tools/list` 是唯一完整契约。先发现，再调用：
 
 ```bash
-python3 scripts/al_site.py tools
-python3 scripts/al_site.py tools --names
-python3 scripts/al_site.py tools --filter deployment
-python3 scripts/al_site.py describe SaveSiteVersion
-python3 scripts/al_site.py call GetCurrentSite
-python3 scripts/al_site.py call SetSiteAccessPolicy \
+python3 scripts/al_mcp.py tools
+python3 scripts/al_mcp.py tools --names
+python3 scripts/al_mcp.py tools --filter deployment
+python3 scripts/al_mcp.py describe SaveSiteVersion
+python3 scripts/al_mcp.py call GetCurrentSite
+python3 scripts/al_mcp.py call SetSiteAccessPolicy \
   --arguments '{"site_id":"example","audience":"owner"}'
 ```
 
 脚本为当前每个 Site MCP 工具都生成 kebab-case 入口，例如：
 
 ```bash
-python3 scripts/al_site.py get-site-events --arg site_id=example
-python3 scripts/al_site.py set-site-domain \
+python3 scripts/al_mcp.py get-site-events --arg site_id=example
+python3 scripts/al_mcp.py set-site-domain \
   --arg site_id=example --arg hostname=www.example.org --arg verification_method=dns-txt
 ```
 
@@ -67,36 +67,36 @@ python3 scripts/al_site.py set-site-domain \
 创建、选择和查看 Site：
 
 ```bash
-python3 scripts/al_site.py create "My Site"
-python3 scripts/al_site.py select SITE_ID
-python3 scripts/al_site.py current
-python3 scripts/al_site.py sites
+python3 scripts/al_mcp.py create "My Site"
+python3 scripts/al_mcp.py select SITE_ID
+python3 scripts/al_mcp.py current
+python3 scripts/al_mcp.py sites
 ```
 
 保存不可变版本：
 
 ```bash
 # 独立 Site：直接把本地目录规范化、上传并保存为不可变 SourceBundle
-python3 scripts/al_site.py save-local . --site-id SITE_ID
+python3 scripts/al_mcp.py save-local . --site-id SITE_ID
 
 # 组合模式：显式消费 al-sandbox 生成的一次性 handoff
-python3 scripts/al_site.py save-current --site-id SITE_ID \
+python3 scripts/al_mcp.py save-current --site-id SITE_ID \
   --handoff @/tmp/al-site-handoff.json
 
 # 端到端测试模式：创建专用 Site，并把精确 Site UID/Version/Deployment
 # 写入 0600 清单；组合测试将 handoff 作为唯一 Sandbox -> Site 入口
-python3 scripts/al_site.py test-deploy-current \
+python3 scripts/al_mcp.py test-deploy-current \
   --handoff @/tmp/al-site-handoff.json --confirm-public
 
 # 测试完成后只清理由该清单记录且 UID 仍匹配的专用测试 Site
-python3 scripts/al_site.py cleanup-test-run \
+python3 scripts/al_mcp.py cleanup-test-run \
   ~/.al-site-mcp/test-runs/<run-id>.json --confirm
 
 # 独立 Site：从远端不可变 Git commit 构建
-python3 scripts/al_site.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID
+python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID
 
 # 独立 Site：部署已固定 digest 的 OCI image
-python3 scripts/al_site.py save-oci REGISTRY/REPOSITORY@sha256:DIGEST --site-id SITE_ID
+python3 scripts/al_mcp.py save-oci REGISTRY/REPOSITORY@sha256:DIGEST --site-id SITE_ID
 ```
 
 保存源码版本前必须检查构建契约：
@@ -109,9 +109,9 @@ python3 scripts/al_site.py save-oci REGISTRY/REPOSITORY@sha256:DIGEST --site-id 
 等待构建并部署：
 
 ```bash
-python3 scripts/al_site.py wait-version VERSION_ID --site-id SITE_ID
-python3 scripts/al_site.py deploy VERSION_ID --site-id SITE_ID
-python3 scripts/al_site.py wait-deployment DEPLOYMENT_ID --site-id SITE_ID
+python3 scripts/al_mcp.py wait-version VERSION_ID --site-id SITE_ID
+python3 scripts/al_mcp.py deploy VERSION_ID --site-id SITE_ID
+python3 scripts/al_mcp.py wait-deployment DEPLOYMENT_ID --site-id SITE_ID
 ```
 
 ## 独立部署本地目录
@@ -119,7 +119,7 @@ python3 scripts/al_site.py wait-deployment DEPLOYMENT_ID --site-id SITE_ID
 `deploy-local` 是独立 Site 的默认开发路径。它不要求项目是 Git 仓库，也不调用 Sandbox：
 
 ```bash
-python3 scripts/al_site.py deploy-local . --site-id SITE_ID
+python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID
 ```
 
 客户端会先执行与服务端一致的关键安全预检：平台 denylist、`.alignore`、大小/文件数/路径限制、symlink 边界和高置信凭据扫描；随后生成确定性的 tar.gz。Site MCP 只代理小型上传控制 JSON，客户端使用 Site Manager 签发的精确短期 URL 将归档分片直接上传到 TOS；源码字节不经过 MCP 或 APIG。服务端完成后会重新校验归档长度和 SHA-256、安全解包、执行完整规范化和扫描，发布到平台自有 OCI `source@sha256:...`，再进入与 Sandbox/Git 完全相同的 build、scan、preview、deploy 状态机。
@@ -133,14 +133,14 @@ python3 scripts/al_site.py deploy-local . --site-id SITE_ID
 `deploy-local-git` 不使用 Sandbox。它验证工作区干净、HEAD 是 40～64 位 commit、当前分支的远端 ref 正好指向该 commit，然后调用 `SaveSiteVersion(source=git)`，等待版本 Ready，再调用 `DeploySiteVersion`：
 
 ```bash
-python3 scripts/al_site.py deploy-local-git . --site-id SITE_ID
+python3 scripts/al_mcp.py deploy-local-git . --site-id SITE_ID
 ```
 
 私有 HTTPS Git 凭据只能从环境变量读取，避免写入命令行历史：
 
 ```bash
 export MY_GIT_AUTH='Bearer <token>'
-python3 scripts/al_site.py deploy-local-git . \
+python3 scripts/al_mcp.py deploy-local-git . \
   --site-id SITE_ID \
   --credential-env MY_GIT_AUTH
 ```

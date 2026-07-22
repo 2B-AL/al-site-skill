@@ -25,19 +25,19 @@ Site MCP 的原生 source 类型只有：
 只保存版本：
 
 ```bash
-python3 scripts/al_site.py save-local-git . --site-id SITE_ID
+python3 scripts/al_mcp.py save-local-git . --site-id SITE_ID
 ```
 
 保存、等待 Ready、部署并等待 Ready：
 
 ```bash
-python3 scripts/al_site.py deploy-local-git . --site-id SITE_ID
+python3 scripts/al_mcp.py deploy-local-git . --site-id SITE_ID
 ```
 
 传 build/runtime override：
 
 ```bash
-python3 scripts/al_site.py deploy-local-git . \
+python3 scripts/al_mcp.py deploy-local-git . \
   --site-id SITE_ID \
   --build '{"mode":"dockerfile","dockerfile":"Dockerfile","path_prefix_aware":true}' \
   --runtime '{"port":8080,"health_path":"/healthz"}'

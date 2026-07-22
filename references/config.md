@@ -9,8 +9,8 @@ https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com
 切换其他环境时设置一次：
 
 ```bash
-python3 scripts/al_site.py configure --gateway-url https://<site-mcp-public-host>
-python3 scripts/al_site.py config
+python3 scripts/al_mcp.py configure --gateway-url https://<site-mcp-public-host>
+python3 scripts/al_mcp.py config
 ```
 
 环境变量优先于本地状态：

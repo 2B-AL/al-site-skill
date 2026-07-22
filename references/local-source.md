@@ -23,19 +23,19 @@ local directory
 只上传并保存版本：
 
 ```bash
-python3 scripts/al_site.py save-local . --site-id SITE_ID
+python3 scripts/al_mcp.py save-local . --site-id SITE_ID
 ```
 
 保存、等待版本 Ready、部署并等待部署 Ready：
 
 ```bash
-python3 scripts/al_site.py deploy-local . --site-id SITE_ID
+python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID
 ```
 
 覆盖构建和运行配置：
 
 ```bash
-python3 scripts/al_site.py deploy-local . \
+python3 scripts/al_mcp.py deploy-local . \
   --site-id SITE_ID \
   --build '{"mode":"dockerfile","dockerfile":"Dockerfile","path_prefix_aware":true}' \
   --runtime '{"port":8080,"health_path":"/healthz"}'
