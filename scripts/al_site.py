@@ -857,10 +857,15 @@ def result_text(result):
 
 
 def call_tool(name, arguments):
-    result = rpc("tools/call", {"name": name, "arguments": arguments})
-    cache_resource_ids(result)
+    result = call_tool_result(name, arguments)
     if isinstance(result, dict) and result.get("isError"):
         raise SystemExit(result_text(result))
+    return result
+
+
+def call_tool_result(name, arguments):
+    result = rpc("tools/call", {"name": name, "arguments": arguments})
+    cache_resource_ids(result)
     return result
 
 
@@ -1126,8 +1131,11 @@ def load_source_handoff(value):
         expiry = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except ValueError:
         raise SystemExit("Sandbox source handoff expires_at is invalid")
-    if expiry.tzinfo is None or expiry <= datetime.datetime.now(datetime.timezone.utc):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if expiry.tzinfo is None or expiry <= now:
         raise SystemExit("Sandbox source handoff has expired; request a fresh handoff from al-sandbox-skill")
+    if expiry <= now + datetime.timedelta(seconds=60):
+        raise SystemExit("Sandbox source handoff expires in less than 60 seconds; request a fresh handoff before planning or saving")
     manifest = descriptor.get("source_manifest")
     if manifest is not None and not isinstance(manifest, dict):
         raise SystemExit("Sandbox source handoff source_manifest must be an object")
@@ -1152,17 +1160,23 @@ def remove_consumed_handoff_file(value):
         raise SystemExit(f"SiteVersion was saved, but the consumed handoff file could not be removed: {error}")
 
 
-def parse_arg_value(value):
+def parse_arg_value(value, force_string=False):
     raw = str(value)
     if raw.startswith("@"):
         return pathlib.Path(raw[1:]).read_text(encoding="utf-8")
+    if force_string:
+        return raw
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         return raw
 
 
-def merge_call_arguments(arguments_json, arg_items):
+def string_tool_argument(key):
+    return key in {"resource_version", "cursor"} or key.endswith(("_id", "_uid"))
+
+
+def merge_call_arguments(arguments_json, arg_items, string_arg_items=None):
     arguments = load_json_object(arguments_json)
     for item in arg_items or []:
         if "=" not in item:
@@ -1171,7 +1185,15 @@ def merge_call_arguments(arguments_json, arg_items):
         key = key.strip()
         if not key:
             raise SystemExit(f"--arg key cannot be empty: {item}")
-        arguments[key] = parse_arg_value(value)
+        arguments[key] = parse_arg_value(value, force_string=string_tool_argument(key))
+    for item in string_arg_items or []:
+        if "=" not in item:
+            raise SystemExit(f"--arg-string must use key=value format: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--arg-string key cannot be empty: {item}")
+        arguments[key] = parse_arg_value(value, force_string=True)
     return arguments
 
 
@@ -1229,7 +1251,7 @@ def result_meta_id(result, key):
     return value
 
 
-def create_test_site(display_name, confirm_public):
+def create_test_site(display_name, confirm_public, created_callback=None):
     capabilities = platform_capabilities()
     routing = capabilities.get("routing") if isinstance(capabilities.get("routing"), dict) else {}
     recommended = routing.get("recommendedCreate") if isinstance(routing.get("recommendedCreate"), dict) else {}
@@ -1244,12 +1266,35 @@ def create_test_site(display_name, confirm_public):
     }
     if audience == "public":
         arguments["confirm_public"] = True
-    created = call_tool("CreateSite", arguments)
+    created = call_tool_result("CreateSite", arguments)
     site_id = result_meta_id(created, "site_id")
     site_uid = result_uid(created)
     if not site_uid:
         raise SystemExit("test Site was created but the MCP response omitted its UID; refusing untracked testing")
+    if created_callback:
+        created_callback(created, site_id, site_uid)
+    if created.get("isError"):
+        raise SystemExit(result_text(created))
     return created, site_id, site_uid
+
+
+def begin_test_run(source_kind, destination="", run_id=""):
+    run_id = run_id or str(uuid.uuid4())
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    run = {
+        "schema_version": "al-site-test-run/v1", "run_id": run_id,
+        "created_at": now, "updated_at": now, "created_site": False,
+        "source_kind": source_kind, "status": "creating-site", "resources": {},
+    }
+    target = save_test_run(run, destination)
+    return target, run
+
+
+def record_created_test_site(target, run, site_id, site_uid):
+    run["created_site"] = True
+    run["site_id"] = site_id
+    run["site_uid"] = site_uid
+    update_test_run(target, run, "site-created", site=site_id)
 
 
 def new_test_run(site_id, site_uid, source_kind, destination="", run_id=""):
@@ -1622,6 +1667,7 @@ def register_generic_tool_commands(subparsers):
         parser.set_defaults(site_tool=tool)
         parser.add_argument("--arguments", default="{}", help="JSON object or @file.json")
         parser.add_argument("--arg", action="append", default=[], help="Add one argument as key=value")
+        parser.add_argument("--arg-string", action="append", default=[], help="Add one string argument as key=value without JSON coercion")
 
 
 def add_site_id(parser):
@@ -1665,6 +1711,7 @@ def build_parser():
     call.add_argument("tool")
     call.add_argument("--arguments", default="{}")
     call.add_argument("--arg", action="append", default=[])
+    call.add_argument("--arg-string", action="append", default=[])
 
     create = sub.add_parser("create")
     create.add_argument("display_name")
@@ -1816,7 +1863,7 @@ def main():
         print_json(find_tool_definition(rpc("tools/list"), args.tool))
         return
     if args.action == "call":
-        print_json(call_tool(args.tool, merge_call_arguments(args.arguments, args.arg)))
+        print_json(call_tool(args.tool, merge_call_arguments(args.arguments, args.arg, args.arg_string)))
         return
     if args.action == "cleanup-test-run":
         if not args.confirm:
@@ -1833,10 +1880,15 @@ def main():
     if args.action in {"test-deploy-local", "test-deploy-current"}:
         run_id = str(uuid.uuid4())
         run_target = prepare_test_run_destination(args.run_file, run_id)
-        _, site_id, site_uid = create_test_site(args.display_name, args.confirm_public)
         source_kind = "local" if args.action == "test-deploy-local" else "sandbox-handoff"
-        target, run = new_test_run(site_id, site_uid, source_kind, str(run_target), run_id)
+        target, run = begin_test_run(source_kind, str(run_target), run_id)
         try:
+            _, site_id, site_uid = create_test_site(
+                args.display_name, args.confirm_public,
+                lambda _created, current_site_id, current_site_uid: record_created_test_site(
+                    target, run, current_site_id, current_site_uid
+                ),
+            )
             if args.action == "test-deploy-local":
                 source_summary, plan, saved = save_local_source(args.path, site_id, args.build, args.runtime)
             else:
@@ -1866,7 +1918,7 @@ def main():
         })
         return
     if hasattr(args, "site_tool"):
-        print_json(call_tool(args.site_tool, merge_call_arguments(args.arguments, args.arg)))
+        print_json(call_tool(args.site_tool, merge_call_arguments(args.arguments, args.arg, args.arg_string)))
         return
     if args.action == "create":
         capabilities = platform_capabilities()
@@ -1896,7 +1948,13 @@ def main():
         print_json(call_tool("CreateSite", arguments))
         return
     if args.action == "select":
-        print_json(call_tool("SelectSite", {"site_id": args.site_id}))
+        current = call_tool_result("GetCurrentSite", {})
+        arguments = {"site_id": args.site_id}
+        if isinstance(current, dict) and not current.get("isError"):
+            resource_version = str(current.get("_meta", {}).get("resourceVersion") or "").strip()
+            if resource_version:
+                arguments["resource_version"] = resource_version
+        print_json(call_tool("SelectSite", arguments))
         return
     if args.action == "current":
         print_json(call_tool("GetCurrentSite", {}))

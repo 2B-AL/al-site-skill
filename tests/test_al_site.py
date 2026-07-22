@@ -1,4 +1,5 @@
 import importlib.util
+import datetime
 import json
 import os
 import pathlib
@@ -42,6 +43,13 @@ class SiteClientTest(unittest.TestCase):
     def test_argument_merge_parses_json(self):
         value = al_site.merge_call_arguments('{"site_id":"a"}', ["confirm=true", "step=2", 'users=["u"]'])
         self.assertEqual({"site_id": "a", "confirm": True, "step": 2, "users": ["u"]}, value)
+
+    def test_identifier_arguments_remain_strings(self):
+        value = al_site.merge_call_arguments("{}", ["resource_version=46302628", "site_id=123", "step=2"], ["custom=001"])
+        self.assertEqual("46302628", value["resource_version"])
+        self.assertEqual("123", value["site_id"])
+        self.assertEqual(2, value["step"])
+        self.assertEqual("001", value["custom"])
 
     def test_git_scp_url_is_normalized(self):
         self.assertEqual(
@@ -238,6 +246,16 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual("sandbox_handoff", source["type"])
         self.assertEqual("sandbox-conversation", source["sandbox_conversation_id"])
 
+    def test_sandbox_handoff_requires_sixty_second_safety_margin(self):
+        descriptor = {
+            "schema_version": "sandbox-site-handoff/v1", "source_export_grant": "g" * 64,
+            "sandbox_conversation_id": "conversation", "source_root": "/workspace/project",
+            "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)).isoformat(),
+            "source_manifest": {"digest": "sha256:" + "a" * 64},
+        }
+        with self.assertRaisesRegex(SystemExit, "less than 60 seconds"):
+            al_site.load_source_handoff(json.dumps(descriptor))
+
     def test_consumed_handoff_file_is_removed_only_explicitly(self):
         with tempfile.TemporaryDirectory() as directory:
             descriptor = pathlib.Path(directory) / "handoff.json"
@@ -264,6 +282,29 @@ class SiteClientTest(unittest.TestCase):
             _, loaded = al_site.load_test_run(saved)
             self.assertEqual("uid-test", loaded["site_uid"])
             self.assertEqual("site-test", record["resources"]["site"])
+
+    def test_test_run_exists_before_site_creation_and_tracks_partial_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = "22222222-2222-2222-2222-222222222222"
+            target, run = al_site.begin_test_run("sandbox-handoff", pathlib.Path(directory) / "run.json", run_id)
+            self.assertTrue(target.exists())
+            self.assertFalse(run["created_site"])
+            al_site.record_created_test_site(target, run, "partial-site", "partial-uid")
+            _, loaded = al_site.load_test_run(target)
+            self.assertTrue(loaded["created_site"])
+            self.assertEqual("partial-site", loaded["site_id"])
+            self.assertEqual("partial-uid", loaded["site_uid"])
+
+    def test_create_test_site_records_identity_before_partial_error(self):
+        capabilities = {"routing": {"recommendedCreate": {"audience": "owner"}}}
+        partial = {"isError": True, "content": [{"type": "text", "text": "selection failed"}], "_meta": {"site_id": "created-site", "uid": "created-uid"}}
+        recorded = []
+        with mock.patch.object(al_site, "platform_capabilities", return_value=capabilities), mock.patch.object(
+            al_site, "call_tool_result", return_value=partial
+        ):
+            with self.assertRaisesRegex(SystemExit, "selection failed"):
+                al_site.create_test_site("test", False, lambda result, site_id, site_uid: recorded.append((site_id, site_uid)))
+        self.assertEqual([("created-site", "created-uid")], recorded)
 
     def test_wait_version_uses_cursor_without_restarting_work(self):
         responses = [
