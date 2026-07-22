@@ -5,7 +5,7 @@
 Site MCP 的原生 source 类型只有：
 
 - `source_bundle`：由公共 Gateway 上传本地目录后得到的平台 OCI digest 与短期 receipt，独立于 Sandbox。
-- `current_conversation`：向 Sandbox MCP 获取一次性 SourceBundle export grant，依赖 Sandbox。
+- `sandbox_handoff`：显式消费 `al-sandbox-skill handoff` 返回的一次性 SourceBundle export grant；Site MCP 不持有长期 Sandbox endpoint/token。
 - `git`：由 Site source importer 拉取固定 commit，独立于 Sandbox。
 - `oci`：校验并部署固定 image digest，独立于 Sandbox。
 

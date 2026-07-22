@@ -77,7 +77,7 @@ python3 scripts/al_site.py save-local . --site-id SITE_ID
 {"mode":"dockerfile","context":"app","dockerfile":"Dockerfile"}
 ```
 
-若同时配置 `context=app` 和 `dockerfile=app/Dockerfile`，Build Executor 会查找 `app/app/Dockerfile`。本地发布命令会在上传前给出解析后的缺失路径；Sandbox/Git 来源需要在保存版本前自行核对归档或仓库布局。
+若同时配置 `context=app` 和 `dockerfile=app/Dockerfile`，Build Executor 会查找 `app/app/Dockerfile`。现在所有强类型保存命令都会先调用 `PlanSiteVersion`；带 handoff/local manifest 的来源会在创建不可变版本前返回解析后的缺失路径。
 
 ## image has non-numeric user
 
@@ -93,15 +93,16 @@ container has runAsNonRoot and image has non-numeric user (nonroot), cannot veri
 USER 65532:65532
 ```
 
-不要放宽 Site 的 `runAsNonRoot`。本地发布命令会提前拒绝最终阶段中显式的命名 `USER` 或 UID 0；Sandbox/Git 来源仍需在源码侧遵守该约束。
+不要放宽 Site 的 `runAsNonRoot`。客户端 lint 会提前拒绝最终阶段中显式的命名 `USER` 或 UID 0；平台还会在 Preview 前检查最终 OCI config、入口 mode/owner、架构和 ELF interpreter，并返回精确的 runtime contract 错误。
 
 ## 版本或部署一直未 Ready
 
 ```bash
-python3 scripts/al_site.py version VERSION_ID --site-id SITE_ID
-python3 scripts/al_site.py get-site-logs --arg site_id=SITE_ID
+python3 scripts/al_site.py wait-version VERSION_ID --site-id SITE_ID
+python3 scripts/al_site.py get-site-version-logs \
+  --arg site_id=SITE_ID --arg version_id=VERSION_ID --arg stage=build --arg tail_lines=200
 python3 scripts/al_site.py get-site-events --arg site_id=SITE_ID
 python3 scripts/al_site.py deployment DEPLOYMENT_ID --site-id SITE_ID
 ```
 
-以返回的 `phase`、conditions、错误 code 和真实 URL 为准，不用 Pod Ready 或客户端 HTTP timeout 代替业务状态。
+`wait-version` 使用带 cursor 的长轮询；即使没有状态变化也会周期性返回 heartbeat，而不是让 Agent 盲等。失败时使用 owner-scoped 的 `GetSiteVersionLogs`，不接受调用方提供 namespace/Pod/container。以返回的 `phase`、stage、attempt、conditions、错误 code 和真实 URL 为准，不用 Pod Ready 或客户端 HTTP timeout 代替业务状态。

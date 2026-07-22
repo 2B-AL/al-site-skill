@@ -23,6 +23,7 @@ class SiteClientTest(unittest.TestCase):
         parser = al_site.build_parser()
         args = parser.parse_args(["get-site-events", "--arg", "site_id=example"])
         self.assertEqual("GetSiteEvents", args.site_tool)
+        self.assertEqual("test-deploy-current", parser.parse_args(["test-deploy-current", "--handoff", "@handoff.json"]).action)
 
     def test_gateway_url_validation(self):
         self.assertEqual("https://gateway.example", al_site.validate_gateway_url("https://gateway.example/mcp"))
@@ -166,12 +167,140 @@ class SiteClientTest(unittest.TestCase):
             }
             with mock.patch.object(al_site, "post_source_archive", return_value=uploaded), mock.patch.object(
                 al_site, "selected_site_id", return_value="site-1"
-            ), mock.patch.object(al_site, "call_tool", return_value={"_meta": {"version_id": "v1"}}) as call:
-                summary, result = al_site.save_local_source(root, "site-1")
+            ), mock.patch.object(al_site, "plan_site_version", return_value={"structuredContent": {"valid": True}}), mock.patch.object(
+                al_site, "call_tool", return_value={"_meta": {"version_id": "v1"}}
+            ) as call:
+                summary, plan, result = al_site.save_local_source(root, "site-1")
             arguments = call.call_args.args[1]
             self.assertEqual("sensitive-receipt", arguments["source"]["upload_receipt"])
             self.assertNotIn("receipt", summary)
-            self.assertNotIn("sensitive-receipt", json.dumps({"summary": summary, "result": result}))
+            self.assertNotIn("sensitive-receipt", json.dumps({"summary": summary, "plan": plan, "result": result}))
+
+    def test_dependency_free_static_source_selects_static_profile_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "index.html").write_text("<html></html>", encoding="utf-8")
+            (root / "app.js").write_text("console.log('ok')", encoding="utf-8")
+            build = al_site.normalized_local_build(root)
+            self.assertEqual("static", build["mode"])
+            self.assertTrue(build["path_prefix_aware"])
+
+    def test_static_source_rejects_unverified_root_relative_asset_assertion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "index.html").write_text('<script src="/app.js"></script>', encoding="utf-8")
+            (root / "app.js").write_text("ok", encoding="utf-8")
+            build = al_site.normalized_local_build(root)
+            self.assertEqual("static", build["mode"])
+            self.assertFalse(build["path_prefix_aware"])
+
+    def test_source_manifest_digest_includes_file_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / "index.html"
+            source.write_text("first", encoding="utf-8")
+            first = al_site.create_source_manifest(root)
+            source.write_text("second", encoding="utf-8")
+            second = al_site.create_source_manifest(root)
+            self.assertNotEqual(first["digest"], second["digest"])
+
+    def test_dependency_manifest_keeps_auto_profile(self):
+        manifest = {"files": ["index.html", "package.json"]}
+        self.assertEqual({}, al_site.normalized_manifest_build(manifest))
+
+    def test_plan_profile_revision_is_pinned_into_saved_version(self):
+        arguments = al_site.save_version_arguments(
+            "site-1", {"type": "git", "repository": "https://example.com/repo.git", "commit_sha": "a" * 40},
+            plan={"structuredContent": {"profileRevision": "static-v1"}},
+        )
+        self.assertEqual("static-v1", arguments["build_plan_revision"])
+
+    def test_normalized_plan_is_the_saved_build_contract(self):
+        build, runtime = al_site.normalized_inputs_from_plan({
+            "structuredContent": {
+                "normalizedBuild": {"mode": "Railpack", "context": ".", "pathPrefixAware": True},
+                "normalizedRuntime": {"port": 8080, "healthPath": "/"},
+            }
+        }, {}, {})
+        self.assertEqual({"mode": "railpack", "context": ".", "path_prefix_aware": True}, build)
+        self.assertEqual({"port": 8080, "health_path": "/"}, runtime)
+
+    def test_explicit_sandbox_handoff_does_not_read_site_or_sandbox_state(self):
+        descriptor = {
+            "schema_version": "sandbox-site-handoff/v1",
+            "source_export_grant": "g" * 64,
+            "sandbox_conversation_id": "sandbox-conversation",
+            "source_root": "/workspace/project",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "source_manifest": {"files": ["index.html"], "digest": "sha256:" + "a" * 64},
+        }
+        source = al_site.load_source_handoff(json.dumps(descriptor))
+        self.assertEqual("sandbox_handoff", source["type"])
+        self.assertEqual("sandbox-conversation", source["sandbox_conversation_id"])
+
+    def test_consumed_handoff_file_is_removed_only_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            descriptor = pathlib.Path(directory) / "handoff.json"
+            descriptor.write_text("{}", encoding="utf-8")
+            al_site.remove_consumed_handoff_file("@" + str(descriptor))
+            self.assertFalse(descriptor.exists())
+
+    def test_public_test_site_requires_confirmation_before_mutation(self):
+        capabilities = {"routing": {"recommendedCreate": {"audience": "public", "publicPublishing": True}}}
+        with mock.patch.object(al_site, "platform_capabilities", return_value=capabilities), mock.patch.object(
+            al_site, "call_tool"
+        ) as call:
+            with self.assertRaisesRegex(SystemExit, "confirm-public"):
+                al_site.create_test_site("test", False)
+        call.assert_not_called()
+
+    def test_test_run_manifest_is_0600_and_tracks_exact_site_uid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_id = "11111111-1111-1111-1111-111111111111"
+            target = al_site.prepare_test_run_destination(pathlib.Path(directory) / "run.json", run_id)
+            saved, record = al_site.new_test_run("site-test", "uid-test", "local", str(target), run_id)
+            self.assertEqual(target, saved)
+            self.assertEqual(0o600, saved.stat().st_mode & 0o777)
+            _, loaded = al_site.load_test_run(saved)
+            self.assertEqual("uid-test", loaded["site_uid"])
+            self.assertEqual("site-test", record["resources"]["site"])
+
+    def test_wait_version_uses_cursor_without_restarting_work(self):
+        responses = [
+            {"structuredContent": {"cursor": "10", "version": {"status": {"phase": "Building", "build": {"state": "Running", "attempt": 1}}}}},
+            {"structuredContent": {"cursor": "11", "terminal": True, "version": {"status": {"phase": "Ready", "build": {"state": "Succeeded", "attempt": 1}}}}},
+        ]
+        with mock.patch.object(al_site, "available_tool_names", return_value={"WatchSiteVersion"}), mock.patch.object(
+            al_site, "call_tool", side_effect=responses
+        ) as call:
+            result = al_site.wait_for_version("site-1", "version-1", 30)
+        self.assertEqual("Ready", al_site.phase_of(result))
+        self.assertEqual("10", call.call_args_list[1].args[1]["cursor"])
+
+    def test_wait_deployment_uses_cursor_until_traffic_ready(self):
+        responses = [
+            {"structuredContent": {"cursor": "20", "deployment": {"status": {"phase": "CreatingRevision", "trafficPercent": 0}}}},
+            {"structuredContent": {"cursor": "21", "terminal": True, "deployment": {"status": {"phase": "Ready", "trafficPercent": 100}}}},
+        ]
+        with mock.patch.object(al_site, "available_tool_names", return_value={"WatchSiteDeployment"}), mock.patch.object(
+            al_site, "call_tool", side_effect=responses
+        ) as call:
+            result = al_site.wait_for_deployment("site-1", "deployment-1", 30)
+        self.assertEqual("Ready", al_site.phase_of(result))
+        self.assertEqual("20", call.call_args_list[1].args[1]["cursor"])
+
+    def test_active_version_log_progress_is_cursor_deduplicated(self):
+        response = {"structuredContent": {"cursor": "2026-07-22T12:00:00Z", "content": "vertex 1\nvertex 2"}}
+        cursors = {}
+        with mock.patch.object(al_site, "call_tool", return_value=response) as call:
+            al_site.emit_active_version_log_progress(
+                "site-1", "version-1", {"build": {"state": "Running"}}, cursors,
+            )
+            al_site.emit_active_version_log_progress(
+                "site-1", "version-1", {"build": {"state": "Running"}}, cursors,
+            )
+        self.assertEqual(2, call.call_count)
+        self.assertEqual("2026-07-22T12:00:00Z", cursors["build"])
 
     def test_direct_part_upload_never_sends_site_oauth_headers(self):
         class Response:

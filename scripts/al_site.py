@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import pathlib
+import posixpath
 import re
 import stat
 import subprocess
@@ -28,11 +29,13 @@ DEFAULT_LOGIN_CALLBACK_URL = "http://127.0.0.1:8766/oauth/callback"
 DEFAULT_GATEWAY_URL = "https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com"
 STATE_DIR = pathlib.Path(os.environ.get("AL_SITE_STATE_DIR", "~/.al-site-mcp")).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
+TEST_RUNS_DIR = STATE_DIR / "test-runs"
 
 SITE_TOOLS = (
-    "CreateSite", "SelectSite", "GetCurrentSite", "GetSite", "ListSites", "UpdateSite",
-    "SaveSiteVersion", "GetSiteVersion", "ListSiteVersions", "DeleteSiteVersion",
-    "DeploySiteVersion", "GetSiteDeployment", "ListSiteDeployments", "PromoteSiteDeployment",
+    "GetSitePlatformCapabilities", "CreateSite", "SelectSite", "GetCurrentSite", "GetSite", "ListSites", "UpdateSite",
+    "PlanSiteVersion", "SaveSiteVersion", "GetSiteVersion", "WatchSiteVersion", "GetSiteVersionLogs",
+    "CancelSiteVersion", "ListSiteVersions", "DeleteSiteVersion",
+    "DeploySiteVersion", "GetSiteDeployment", "WatchSiteDeployment", "ListSiteDeployments", "PromoteSiteDeployment",
     "RollbackSite", "CancelSiteDeployment", "PauseSiteDeployment", "GetSiteAccessPolicy",
     "SetSiteAccessPolicy", "SetSiteGovernance", "SubmitSiteAppeal", "SetSiteDomain",
     "ListSiteDomains", "VerifySiteDomain", "DeleteSiteDomain", "GetSiteLogs", "GetSiteEvents",
@@ -69,6 +72,56 @@ def save_state(state):
         handle.write("\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, STATE_FILE)
+
+
+def save_test_run(record, destination=""):
+    if not isinstance(record, dict) or record.get("schema_version") != "al-site-test-run/v1":
+        raise SystemExit("refusing to persist an invalid Site test run manifest")
+    run_id = str(record.get("run_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-f-]{36}", run_id):
+        raise SystemExit("Site test run manifest has an invalid run_id")
+    target = pathlib.Path(destination).expanduser() if destination else TEST_RUNS_DIR / (run_id + ".json")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+    return target
+
+
+def load_test_run(value):
+    target = pathlib.Path(str(value or "")).expanduser()
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot read Site test run manifest: {error}")
+    if not isinstance(record, dict) or record.get("schema_version") != "al-site-test-run/v1" or not record.get("created_site"):
+        raise SystemExit("refusing to clean a file that is not an AL Site test run manifest")
+    if not record.get("site_id") or not record.get("site_uid"):
+        raise SystemExit("Site test run manifest is missing its exact Site identity")
+    return target, record
+
+
+def result_uid(result):
+    meta = result.get("_meta", {}) if isinstance(result, dict) else {}
+    return str(meta.get("uid") or "").strip()
+
+
+def prepare_test_run_destination(destination, run_id):
+    target = pathlib.Path(destination).expanduser() if destination else TEST_RUNS_DIR / (run_id + ".json")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise SystemExit(f"test run manifest already exists: {target}")
+    except OSError as error:
+        raise SystemExit(f"test run manifest path is not writable: {error}")
+    os.close(descriptor)
+    target.unlink()
+    return target
 
 
 def validate_gateway_url(value):
@@ -704,34 +757,85 @@ def create_source_archive(path):
         with archive_path.open("rb") as source:
             for chunk in iter(lambda: source.read(1 << 20), b""):
                 digest.update(chunk)
+        manifest = source_manifest_from_entries(entries)
         return archive_path, {
             "root": str(root), "entry_count": len(entries), "total_bytes": total_bytes,
             "archive_bytes": archive_path.stat().st_size, "transport_sha256": digest.hexdigest(),
+            "_source_manifest": manifest,
         }
     except BaseException:
         archive_path.unlink(missing_ok=True)
         raise
 
 
+def source_manifest_from_entries(entries):
+    manifest_entries = []
+    executable_modes = {}
+    manifest_hash = hashlib.sha256()
+    path_prefix_aware = True
+    root_relative_patterns = (
+        re.compile(r'''(?i)\b(?:src|href|action)\s*=\s*["']/[^/]'''),
+        re.compile(r'''(?i)url\(\s*["']?/[^/]'''),
+        re.compile(r'''(?i)\b(?:fetch|import)\(\s*["']/[^/]'''),
+    )
+    for relative, absolute, info, kind, link_target in entries:
+        manifest_entries.append(relative)
+        mode = 0o755 if kind == "file" and info.st_mode & 0o111 else (0o755 if kind == "directory" else 0o644)
+        content_digest = ""
+        if kind == "file":
+            digest = hashlib.sha256()
+            with absolute.open("rb") as source:
+                for chunk in iter(lambda: source.read(1 << 20), b""):
+                    digest.update(chunk)
+            content_digest = digest.hexdigest()
+            if absolute.suffix.lower() in {".html", ".htm", ".css", ".js", ".mjs", ".jsx", ".ts", ".tsx"}:
+                if info.st_size > 2 << 20:
+                    path_prefix_aware = False
+                else:
+                    text = absolute.read_text(encoding="utf-8", errors="ignore")
+                    if any(pattern.search(text) for pattern in root_relative_patterns):
+                        path_prefix_aware = False
+        manifest_hash.update(f"{relative}\x00{kind}\x00{mode:o}\x00{link_target}\x00{content_digest}\n".encode("utf-8"))
+        if kind == "file" and info.st_mode & 0o111:
+            executable_modes[relative] = mode
+    if len(manifest_entries) > 4096:
+        raise SystemExit("source manifest exceeds the 4096-entry planning limit; narrow build.context/source root")
+    return {
+        "root": ".", "files": manifest_entries, "executable_modes": executable_modes,
+        "digest": "sha256:" + manifest_hash.hexdigest(), "path_prefix_aware": path_prefix_aware,
+    }
+
+
+def create_source_manifest(path):
+    _root, entries, _total_bytes = collect_source_entries(path)
+    return source_manifest_from_entries(entries)
+
+
 def save_local_source(path, site_id, build_json="{}", runtime_json="{}"):
-    validate_local_build(path, build_json)
+    build = normalized_local_build(path, build_json)
+    runtime = load_json_object(runtime_json)
     archive, summary = create_source_archive(path)
     try:
+        plan = plan_site_version(
+            selected_site_id(site_id), "SourceBundle", summary["_source_manifest"], build, runtime
+        )
+        build, runtime = normalized_inputs_from_plan(plan, build, runtime)
         uploaded = post_source_archive(archive)
         source = {
             "type": "source_bundle",
             "source_bundle_ref": uploaded["sourceRef"],
             "upload_receipt": uploaded["receipt"],
         }
-        arguments = save_version_arguments(site_id, source, build_json, runtime_json)
+        arguments = save_version_arguments(site_id, source, build, runtime, plan=plan)
         saved = call_tool("SaveSiteVersion", arguments)
     finally:
         archive.unlink(missing_ok=True)
     # Receipt is intentionally omitted. It is caller-bound and short-lived and
     # must never enter local state, CLI output, or logs.
+    summary.pop("_source_manifest", None)
     summary["source_ref"] = uploaded["sourceRef"]
     summary["source_bundle_digest"] = uploaded["sourceBundleDigest"]
-    return summary, saved
+    return summary, plan, saved
 
 
 def archive_conversation_site():
@@ -758,6 +862,78 @@ def call_tool(name, arguments):
     if isinstance(result, dict) and result.get("isError"):
         raise SystemExit(result_text(result))
     return result
+
+
+def available_tool_names():
+    result = rpc("tools/list")
+    return {str(item.get("name") or "") for item in result.get("tools", []) if isinstance(item, dict)}
+
+
+def structured_content(result):
+    if isinstance(result, dict) and isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    return {}
+
+
+def platform_capabilities(required=True):
+    if "GetSitePlatformCapabilities" not in available_tool_names():
+        if required:
+            raise SystemExit(
+                "Site platform does not expose GetSitePlatformCapabilities; upgrade al-site and al-site-tools-mcp "
+                "before using deterministic create/deploy commands"
+            )
+        return {}
+    return structured_content(call_tool("GetSitePlatformCapabilities", {}))
+
+
+def plan_site_version(site_id, source_type, source_manifest=None, build=None, runtime=None):
+    if "PlanSiteVersion" not in available_tool_names():
+        raise SystemExit(
+            "Site platform does not expose PlanSiteVersion; refusing to create an immutable version without preflight"
+        )
+    arguments = {"site_id": site_id, "source_type": source_type}
+    if source_manifest:
+        arguments["source_manifest"] = source_manifest
+    if build:
+        arguments["build"] = build
+    if runtime:
+        arguments["runtime"] = runtime
+    result = call_tool("PlanSiteVersion", arguments)
+    plan = structured_content(result)
+    if not plan.get("valid"):
+        errors = plan.get("errors") or []
+        raise SystemExit("Site version preflight failed:\n" + json.dumps(errors, ensure_ascii=False, indent=2))
+    warnings = plan.get("warnings") or []
+    if warnings:
+        print("Site version preflight warnings: " + json.dumps(warnings, ensure_ascii=False), file=sys.stderr)
+    print(
+        f"PlanSiteVersion: profile={plan.get('profileRevision') or 'unknown'} "
+        f"mode={plan.get('recommendedMode') or 'unknown'}",
+        file=sys.stderr,
+    )
+    return result
+
+
+def normalized_inputs_from_plan(plan, build, runtime):
+    planned = structured_content(plan)
+
+    def snake(value):
+        if isinstance(value, dict):
+            return {
+                re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower(): snake(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [snake(item) for item in value]
+        return value
+
+    normalized_build = planned.get("normalizedBuild")
+    normalized_runtime = planned.get("normalizedRuntime")
+    effective_build = snake(normalized_build) if isinstance(normalized_build, dict) else dict(build or {})
+    effective_runtime = snake(normalized_runtime) if isinstance(normalized_runtime, dict) else dict(runtime or {})
+    if effective_build.get("mode"):
+        effective_build["mode"] = str(effective_build["mode"]).lower()
+    return effective_build, effective_runtime
 
 
 def load_json_object(value):
@@ -833,7 +1009,7 @@ def validate_local_build(path, build_json="{}"):
         raise SystemExit(f"local project directory does not exist: {root}")
     build = load_json_object(build_json)
     mode = str(build.get("mode") or "auto").strip().lower()
-    if mode not in {"auto", "dockerfile", "railpack"}:
+    if mode not in {"auto", "dockerfile", "railpack", "static"}:
         raise SystemExit(f"unsupported build.mode {mode!r}")
     context = source_relative_path(build.get("context") or ".", "build.context")
     context_path = (root / pathlib.Path(*context.parts)).resolve(strict=False)
@@ -843,7 +1019,7 @@ def validate_local_build(path, build_json="{}"):
         raise SystemExit("build.context resolves outside the local project")
     if not context_path.is_dir():
         raise SystemExit(f"build.context does not exist or is not a directory: {context.as_posix()!r}")
-    if mode == "railpack":
+    if mode in {"railpack", "static"}:
         return {"mode": mode, "context": context.as_posix()}
     dockerfile = source_relative_path(build.get("dockerfile") or "Dockerfile", "build.dockerfile")
     dockerfile_path = (context_path / pathlib.Path(*dockerfile.parts)).resolve(strict=False)
@@ -879,6 +1055,101 @@ def validate_local_build(path, build_json="{}"):
         "dockerfile": dockerfile.as_posix(),
         "final_user": final_user,
     }
+
+
+STATIC_DEPENDENCY_MARKERS = {
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb",
+    "go.mod", "requirements.txt", "pyproject.toml", "Pipfile", "Gemfile", "Cargo.toml", "Dockerfile",
+}
+
+
+def normalized_local_build(path, build_json="{}"):
+    root = pathlib.Path(path).expanduser().resolve()
+    build = load_json_object(build_json) if not isinstance(build_json, dict) else dict(build_json)
+    validation = validate_local_build(root, json.dumps(build))
+    mode = str(build.get("mode") or "auto").lower()
+    context = pathlib.PurePosixPath(validation["context"])
+    context_path = root if context.as_posix() == "." else root / pathlib.Path(*context.parts)
+    names = {item.name for item in context_path.iterdir()} if context_path.is_dir() else set()
+    if mode == "auto" and "index.html" in names and not (names & STATIC_DEPENDENCY_MARKERS):
+        build["mode"] = "static"
+        build.setdefault("context", context.as_posix())
+        manifest = create_source_manifest(root)
+        build.setdefault("path_prefix_aware", bool(manifest.get("path_prefix_aware")))
+    return build
+
+
+def normalized_manifest_build(manifest, build_json="{}"):
+    build = load_json_object(build_json) if not isinstance(build_json, dict) else dict(build_json)
+    mode = str(build.get("mode") or "auto").lower()
+    files = {str(value) for value in (manifest or {}).get("files", [])}
+    context = str(build.get("context") or ".").strip().strip("/")
+    prefix = "" if context in {"", "."} else context + "/"
+    names = {name[len(prefix):] for name in files if name.startswith(prefix) and "/" not in name[len(prefix):]}
+    if mode == "auto" and "index.html" in names and not (names & STATIC_DEPENDENCY_MARKERS):
+        build["mode"] = "static"
+        build.setdefault("context", context or ".")
+        build.setdefault("path_prefix_aware", bool((manifest or {}).get("path_prefix_aware")))
+    return build
+
+
+def load_source_handoff(value):
+    raw = str(value or "").strip()
+    if not raw:
+        raise SystemExit("--handoff requires a descriptor JSON object or @file.json")
+    if raw.startswith("@"):
+        raw = pathlib.Path(raw[1:]).read_text(encoding="utf-8")
+    try:
+        descriptor = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid Sandbox source handoff: {error}")
+    if not isinstance(descriptor, dict):
+        raise SystemExit("Sandbox source handoff must be a JSON object")
+    if descriptor.get("schema_version") != "sandbox-site-handoff/v1":
+        raise SystemExit("Sandbox source handoff uses an unsupported schema_version")
+    source_root = str(descriptor.get("source_root") or "").strip()
+    if (
+        len(source_root) > 4096
+        or "\x00" in source_root
+        or (source_root != "/workspace" and not source_root.startswith("/workspace/"))
+        or posixpath.normpath(source_root) != source_root
+    ):
+        raise SystemExit("Sandbox source handoff has an invalid source_root scope")
+    grant = str(descriptor.get("source_export_grant") or "").strip()
+    conversation_id = str(descriptor.get("sandbox_conversation_id") or "").strip()
+    if len(grant) < 32 or not conversation_id:
+        raise SystemExit("Sandbox source handoff is missing its one-time grant or conversation identity")
+    expires_at = str(descriptor.get("expires_at") or "").strip()
+    if not expires_at:
+        raise SystemExit("Sandbox source handoff is missing expires_at")
+    try:
+        expiry = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit("Sandbox source handoff expires_at is invalid")
+    if expiry.tzinfo is None or expiry <= datetime.datetime.now(datetime.timezone.utc):
+        raise SystemExit("Sandbox source handoff has expired; request a fresh handoff from al-sandbox-skill")
+    manifest = descriptor.get("source_manifest")
+    if manifest is not None and not isinstance(manifest, dict):
+        raise SystemExit("Sandbox source handoff source_manifest must be an object")
+    if not manifest or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(manifest.get("digest") or "")):
+        raise SystemExit("Sandbox source handoff is missing its bounded source manifest digest")
+    return {
+        "type": "sandbox_handoff", "source_export_grant": grant,
+        "sandbox_conversation_id": conversation_id, "source_manifest": manifest or {},
+    }
+
+
+def remove_consumed_handoff_file(value):
+    raw = str(value or "").strip()
+    if not raw.startswith("@"):
+        return
+    descriptor = pathlib.Path(raw[1:])
+    try:
+        descriptor.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SystemExit(f"SiteVersion was saved, but the consumed handoff file could not be removed: {error}")
 
 
 def parse_arg_value(value):
@@ -958,6 +1229,72 @@ def result_meta_id(result, key):
     return value
 
 
+def create_test_site(display_name, confirm_public):
+    capabilities = platform_capabilities()
+    routing = capabilities.get("routing") if isinstance(capabilities.get("routing"), dict) else {}
+    recommended = routing.get("recommendedCreate") if isinstance(routing.get("recommendedCreate"), dict) else {}
+    audience = str(recommended.get("audience") or "owner")
+    if audience == "public" and not confirm_public:
+        raise SystemExit("test publishing is public in this environment; pass --confirm-public before any Site is created")
+    arguments = {
+        "display_name": display_name,
+        "audience": audience,
+        "public_publishing": bool(recommended.get("publicPublishing")),
+        "forward_identity": bool(recommended.get("forwardIdentity")),
+    }
+    if audience == "public":
+        arguments["confirm_public"] = True
+    created = call_tool("CreateSite", arguments)
+    site_id = result_meta_id(created, "site_id")
+    site_uid = result_uid(created)
+    if not site_uid:
+        raise SystemExit("test Site was created but the MCP response omitted its UID; refusing untracked testing")
+    return created, site_id, site_uid
+
+
+def new_test_run(site_id, site_uid, source_kind, destination="", run_id=""):
+    run_id = run_id or str(uuid.uuid4())
+    run = {
+        "schema_version": "al-site-test-run/v1",
+        "run_id": run_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "created_site": True,
+        "site_id": site_id,
+        "site_uid": site_uid,
+        "source_kind": source_kind,
+        "status": "site-created",
+        "resources": {"site": site_id},
+    }
+    target = save_test_run(run, destination)
+    return target, run
+
+
+def update_test_run(target, run, status, **resources):
+    run["status"] = status
+    run["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    tracked = run.setdefault("resources", {})
+    for key, value in resources.items():
+        if value:
+            tracked[key] = value
+            run[key + "_id"] = value
+    save_test_run(run, target)
+
+
+def complete_test_deployment(target, run, site_id, saved, version_timeout, deployment_timeout, interval):
+    version_id = result_meta_id(saved, "version_id")
+    update_test_run(target, run, "version-created", version=version_id)
+    ready_version = wait_for_version(site_id, version_id, version_timeout, interval)
+    update_test_run(target, run, "version-ready")
+    deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
+    deployment_id = result_meta_id(deployment, "deployment_id")
+    update_test_run(target, run, "deployment-created", deployment=deployment_id)
+    ready_deployment = wait_for_deployment(site_id, deployment_id, deployment_timeout, interval)
+    smoke = smoke_public_deployment(ready_deployment)
+    update_test_run(target, run, "ready")
+    return ready_version, ready_deployment, smoke
+
+
 def phase_of(result):
     if isinstance(result, dict):
         meta = result.get("_meta")
@@ -968,7 +1305,179 @@ def phase_of(result):
             status = structured.get("status")
             if isinstance(status, dict) and status.get("phase"):
                 return str(status["phase"])
+            version = structured.get("version")
+            if isinstance(version, dict):
+                status = version.get("status")
+                if isinstance(status, dict) and status.get("phase"):
+                    return str(status["phase"])
+            deployment = structured.get("deployment")
+            if isinstance(deployment, dict):
+                status = deployment.get("status")
+                if isinstance(status, dict) and status.get("phase"):
+                    return str(status["phase"])
     return ""
+
+
+def version_stage_snapshot(result):
+    structured = structured_content(result)
+    version = structured.get("version") if isinstance(structured.get("version"), dict) else structured
+    status = version.get("status") if isinstance(version, dict) else None
+    if not isinstance(status, dict):
+        return {}
+    snapshot = {}
+    for stage in ("source", "build", "scan"):
+        value = status.get(stage)
+        if isinstance(value, dict):
+            snapshot[stage] = {
+                "state": value.get("state"), "attempt": value.get("attempt"),
+                "errorClass": value.get("errorClass"), "errorCode": value.get("errorCode"),
+            }
+    snapshot["phase"] = status.get("phase")
+    return snapshot
+
+
+def emit_active_version_log_progress(site_id, version_id, snapshot, cursors):
+    for stage in ("source", "build", "scan"):
+        value = snapshot.get(stage)
+        if not isinstance(value, dict) or str(value.get("state") or "").lower() != "running":
+            continue
+        try:
+            result = call_tool("GetSiteVersionLogs", {
+                "site_id": site_id, "version_id": version_id, "stage": stage, "tail_lines": 50,
+            })
+        except (Exception, SystemExit) as error:
+            print(f"SiteVersion {stage} log heartbeat unavailable: {error}", file=sys.stderr)
+            return
+        payload = structured_content(result)
+        cursor = str(payload.get("cursor") or "")
+        content = str(payload.get("content") or "").strip()
+        fingerprint = cursor or hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if not content or cursors.get(stage) == fingerprint:
+            return
+        cursors[stage] = fingerprint
+        lines = content.splitlines()[-8:]
+        print(f"SiteVersion {stage} live progress:\n" + "\n".join(lines), file=sys.stderr)
+        return
+
+
+def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0):
+    names = available_tool_names()
+    if "WatchSiteVersion" not in names:
+        return wait_for(
+            "GetSiteVersion", {"site_id": site_id, "version_id": version_id},
+            timeout_seconds, interval_seconds, {"ready"}, {"failed"},
+        )
+    deadline = time.monotonic() + timeout_seconds
+    cursor = ""
+    last_snapshot = None
+    log_cursors = {}
+    started_at = time.monotonic()
+    while True:
+        remaining = max(1, int(deadline - time.monotonic()))
+        arguments = {
+            "site_id": site_id, "version_id": version_id,
+            "timeout_seconds": min(15, remaining),
+        }
+        if cursor:
+            arguments["cursor"] = cursor
+        result = call_tool("WatchSiteVersion", arguments)
+        payload = structured_content(result)
+        cursor = str(payload.get("cursor") or cursor)
+        snapshot = version_stage_snapshot(result)
+        if snapshot != last_snapshot:
+            print("SiteVersion progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+            last_snapshot = snapshot
+        else:
+            print(
+                f"SiteVersion heartbeat: phase={snapshot.get('phase') or 'unknown'} "
+                f"elapsed_seconds={int(time.monotonic() - started_at)}",
+                file=sys.stderr,
+            )
+        if "GetSiteVersionLogs" in names:
+            emit_active_version_log_progress(site_id, version_id, snapshot, log_cursors)
+        phase = phase_of(result).lower()
+        if phase == "ready":
+            return result
+        if phase == "failed":
+            diagnostics = {}
+            if "GetSiteVersionLogs" in names:
+                for stage, value in snapshot.items():
+                    if isinstance(value, dict) and (value.get("state") == "Failed" or value.get("errorCode")):
+                        diagnostics[stage] = structured_content(call_tool("GetSiteVersionLogs", {
+                            "site_id": site_id, "version_id": version_id, "stage": stage, "tail_lines": 200,
+                        }))
+                if not diagnostics:
+                    diagnostics["preview"] = structured_content(call_tool("GetSiteVersionLogs", {
+                        "site_id": site_id, "version_id": version_id, "stage": "preview", "tail_lines": 200,
+                    }))
+            if not diagnostics and "GetSiteEvents" in names:
+                diagnostics["preview_events"] = structured_content(call_tool("GetSiteEvents", {"site_id": site_id}))
+            raise SystemExit(
+                "SiteVersion failed:\n" + json.dumps({"progress": snapshot, "diagnostics": diagnostics}, ensure_ascii=False, indent=2)
+            )
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"timed out waiting for SiteVersion; last progress={json.dumps(snapshot, ensure_ascii=False)}")
+
+
+def deployment_snapshot(result):
+    structured = structured_content(result)
+    deployment = structured.get("deployment") if isinstance(structured.get("deployment"), dict) else structured
+    status = deployment.get("status") if isinstance(deployment, dict) else None
+    if not isinstance(status, dict):
+        return {}
+    return {
+        "phase": status.get("phase"),
+        "trafficPercent": status.get("trafficPercent"),
+        "knativeRevision": status.get("knativeRevision"),
+        "currentStep": status.get("currentStep"),
+        "gateSummary": status.get("gateSummary"),
+    }
+
+
+def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_seconds=5.0):
+    names = available_tool_names()
+    if "WatchSiteDeployment" not in names:
+        return wait_for(
+            "GetSiteDeployment", {"site_id": site_id, "deployment_id": deployment_id},
+            timeout_seconds, interval_seconds, {"ready"}, {"failed", "cancelled"},
+        )
+    deadline = time.monotonic() + timeout_seconds
+    cursor = ""
+    last_snapshot = None
+    started_at = time.monotonic()
+    while True:
+        remaining = max(1, int(deadline - time.monotonic()))
+        arguments = {
+            "site_id": site_id, "deployment_id": deployment_id,
+            "timeout_seconds": min(15, remaining),
+        }
+        if cursor:
+            arguments["cursor"] = cursor
+        result = call_tool("WatchSiteDeployment", arguments)
+        payload = structured_content(result)
+        cursor = str(payload.get("cursor") or cursor)
+        snapshot = deployment_snapshot(result)
+        if snapshot != last_snapshot:
+            print("SiteDeployment progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+            last_snapshot = snapshot
+        else:
+            print(
+                f"SiteDeployment heartbeat: phase={snapshot.get('phase') or 'unknown'} "
+                f"elapsed_seconds={int(time.monotonic() - started_at)}",
+                file=sys.stderr,
+            )
+        phase = phase_of(result).lower()
+        if phase == "ready":
+            return result
+        if phase in {"failed", "cancelled"}:
+            diagnostics = {}
+            if "GetSiteEvents" in names:
+                diagnostics = structured_content(call_tool("GetSiteEvents", {"site_id": site_id}))
+            raise SystemExit(
+                "SiteDeployment failed:\n" + json.dumps({"progress": snapshot, "diagnostics": diagnostics}, ensure_ascii=False, indent=2)
+            )
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"timed out waiting for SiteDeployment; last progress={json.dumps(snapshot, ensure_ascii=False)}")
 
 
 def wait_for(tool, arguments, timeout_seconds, interval_seconds, success_phases, failure_phases):
@@ -988,6 +1497,41 @@ def wait_for(tool, arguments, timeout_seconds, interval_seconds, success_phases,
         if time.monotonic() >= deadline:
             raise SystemExit(f"timed out waiting for {tool}; last phase={phase or 'unknown'}")
         time.sleep(interval_seconds)
+
+
+def deployment_public_url(result):
+    if not isinstance(result, dict):
+        return ""
+    meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
+    for key in ("siteURL", "url", "smokeURL"):
+        value = str(meta.get(key) or "").strip()
+        if value.startswith("https://"):
+            return value
+    structured = structured_content(result)
+    status = structured.get("status") if isinstance(structured.get("status"), dict) else {}
+    for key in ("siteURL", "url", "smokeURL"):
+        value = str(status.get(key) or "").strip()
+        if value.startswith("https://"):
+            return value
+    return ""
+
+
+def smoke_public_deployment(result):
+    url = deployment_public_url(result)
+    if not url:
+        return {"status": "not_applicable", "reason": "deployment exposes no public URL"}
+    request = urllib.request.Request(url, headers={"User-Agent": "al-site-skill/1"}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read(1 << 20)
+            status = int(response.status)
+    except urllib.error.HTTPError as error:
+        raise SystemExit(f"deployment reached Ready but public smoke check returned HTTP {error.code}: {url}")
+    except urllib.error.URLError as error:
+        raise SystemExit(f"deployment reached Ready but public smoke check failed for {url}: {error.reason}")
+    if status < 200 or status >= 400:
+        raise SystemExit(f"deployment reached Ready but public smoke check returned HTTP {status}: {url}")
+    return {"status": "passed", "url": url, "http_status": status, "bytes_read": len(body)}
 
 
 def run_git(path, *args, timeout=30):
@@ -1054,14 +1598,18 @@ def credential_from_env(name):
     return value
 
 
-def save_version_arguments(site_id, source, build_json="{}", runtime_json="{}", credential_env=""):
+def save_version_arguments(site_id, source, build_json="{}", runtime_json="{}", credential_env="", plan=None):
     arguments = {"site_id": selected_site_id(site_id), "source": source}
-    build = load_json_object(build_json)
-    runtime = load_json_object(runtime_json)
+    build = dict(build_json) if isinstance(build_json, dict) else load_json_object(build_json)
+    runtime = dict(runtime_json) if isinstance(runtime_json, dict) else load_json_object(runtime_json)
     if build:
         arguments["build"] = build
     if runtime:
         arguments["runtime"] = runtime
+    planned = structured_content(plan)
+    profile_revision = str(planned.get("profileRevision") or "").strip()
+    if profile_revision:
+        arguments["build_plan_revision"] = profile_revision
     credential = credential_from_env(credential_env)
     if credential:
         arguments["source"]["credential"] = credential
@@ -1120,7 +1668,7 @@ def build_parser():
 
     create = sub.add_parser("create")
     create.add_argument("display_name")
-    create.add_argument("--audience", choices=("owner", "selected", "organization", "public"), default="owner")
+    create.add_argument("--audience", choices=("owner", "selected", "organization", "public"), default="")
     create.add_argument("--scaling-profile", choices=("economy", "balanced", "latency", "burst", "custom"), default="")
     create.add_argument("--runtime-class-name", default="")
     create.add_argument("--public-publishing", action="store_true")
@@ -1133,6 +1681,7 @@ def build_parser():
     get.add_argument("site_id", nargs="?", default="")
 
     save_current = sub.add_parser("save-current")
+    save_current.add_argument("--handoff", default="", help="Explicit one-time Sandbox handoff JSON or @file.json")
     add_save_options(save_current)
     save_git = sub.add_parser("save-git")
     save_git.add_argument("repository")
@@ -1142,6 +1691,7 @@ def build_parser():
     add_save_options(save_git)
     save_oci = sub.add_parser("save-oci")
     save_oci.add_argument("image_digest")
+    save_oci.add_argument("--path-prefix-aware", action="store_true")
     add_site_id(save_oci)
 
     for name in ("save-local", "deploy-local"):
@@ -1151,6 +1701,30 @@ def build_parser():
         if name == "deploy-local":
             add_wait_options(local, 1800)
             local.add_argument("--deployment-timeout-seconds", type=int, default=900)
+
+    test_local = sub.add_parser("test-deploy-local", help="Create a dedicated test Site, deploy local source, and record exact cleanup identity")
+    test_local.add_argument("path", nargs="?", default=".")
+    test_local.add_argument("--display-name", default="AL Site E2E Test")
+    test_local.add_argument("--run-file", default="", help="0600 test run manifest path; defaults below AL_SITE_STATE_DIR")
+    test_local.add_argument("--confirm-public", action="store_true")
+    test_local.add_argument("--build", default="{}")
+    test_local.add_argument("--runtime", default="{}")
+    add_wait_options(test_local, 1800)
+    test_local.add_argument("--deployment-timeout-seconds", type=int, default=900)
+
+    test_current = sub.add_parser("test-deploy-current", help="Create a dedicated test Site and deploy an explicit Sandbox handoff")
+    test_current.add_argument("--handoff", required=True)
+    test_current.add_argument("--display-name", default="AL Sandbox Site E2E Test")
+    test_current.add_argument("--run-file", default="", help="0600 test run manifest path; defaults below AL_SITE_STATE_DIR")
+    test_current.add_argument("--confirm-public", action="store_true")
+    test_current.add_argument("--build", default="{}")
+    test_current.add_argument("--runtime", default="{}")
+    add_wait_options(test_current, 1800)
+    test_current.add_argument("--deployment-timeout-seconds", type=int, default=900)
+
+    cleanup_test = sub.add_parser("cleanup-test-run", help="Delete only the UID-matched Site recorded by a test run")
+    cleanup_test.add_argument("run_file")
+    cleanup_test.add_argument("--confirm", action="store_true")
 
     for name in ("save-local-git", "deploy-local-git"):
         local = sub.add_parser(name)
@@ -1244,11 +1818,74 @@ def main():
     if args.action == "call":
         print_json(call_tool(args.tool, merge_call_arguments(args.arguments, args.arg)))
         return
+    if args.action == "cleanup-test-run":
+        if not args.confirm:
+            raise SystemExit("cleanup-test-run requires --confirm because it permanently deletes the dedicated test Site")
+        target, run = load_test_run(args.run_file)
+        current = call_tool("GetSite", {"site_id": run["site_id"]})
+        current_uid = result_uid(current)
+        if not current_uid or current_uid != run["site_uid"]:
+            raise SystemExit("refusing test cleanup: the current Site UID does not match the recorded test Site UID")
+        deleted = call_tool("DeleteSite", {"site_id": run["site_id"], "confirm": True, "expected_uid": run["site_uid"]})
+        update_test_run(target, run, "deletion-requested")
+        print_json({"run_file": str(target), "site_id": run["site_id"], "deletion": deleted})
+        return
+    if args.action in {"test-deploy-local", "test-deploy-current"}:
+        run_id = str(uuid.uuid4())
+        run_target = prepare_test_run_destination(args.run_file, run_id)
+        _, site_id, site_uid = create_test_site(args.display_name, args.confirm_public)
+        source_kind = "local" if args.action == "test-deploy-local" else "sandbox-handoff"
+        target, run = new_test_run(site_id, site_uid, source_kind, str(run_target), run_id)
+        try:
+            if args.action == "test-deploy-local":
+                source_summary, plan, saved = save_local_source(args.path, site_id, args.build, args.runtime)
+            else:
+                source = load_source_handoff(args.handoff)
+                build = normalized_manifest_build(source.get("source_manifest", {}), args.build)
+                runtime = load_json_object(args.runtime)
+                plan = plan_site_version(site_id, "SandboxExport", source.get("source_manifest"), build, runtime)
+                build, runtime = normalized_inputs_from_plan(plan, build, runtime)
+                saved = call_tool("SaveSiteVersion", save_version_arguments(site_id, source, build, runtime, plan=plan))
+                remove_consumed_handoff_file(args.handoff)
+                source_summary = {
+                    "source_root": "sandbox-handoff",
+                    "manifest_digest": source.get("source_manifest", {}).get("digest", ""),
+                }
+            ready_version, ready_deployment, smoke = complete_test_deployment(
+                target, run, site_id, saved, args.timeout_seconds,
+                args.deployment_timeout_seconds, args.interval_seconds,
+            )
+        except BaseException as error:
+            run["failure_type"] = type(error).__name__
+            update_test_run(target, run, "failed")
+            print(f"test run manifest retained for exact cleanup: {target}", file=sys.stderr)
+            raise
+        print_json({
+            "run_file": str(target), "source": source_summary, "plan": plan,
+            "version": ready_version, "deployment": ready_deployment, "public_smoke": smoke,
+        })
+        return
     if hasattr(args, "site_tool"):
         print_json(call_tool(args.site_tool, merge_call_arguments(args.arguments, args.arg)))
         return
     if args.action == "create":
-        arguments = {"display_name": args.display_name, "audience": args.audience}
+        capabilities = platform_capabilities()
+        routing = capabilities.get("routing") if isinstance(capabilities.get("routing"), dict) else {}
+        recommended = routing.get("recommendedCreate") if isinstance(routing.get("recommendedCreate"), dict) else {}
+        audience = args.audience or str(recommended.get("audience") or "owner")
+        if routing.get("mode") == "apig-path" and audience != "public":
+            raise SystemExit(
+                "this environment uses shared APIG path routing and does not support owner/selected/organization Sites; "
+                "choose --audience public --confirm-public only when public publishing is intended"
+            )
+        if audience == "public" and not args.confirm_public:
+            raise SystemExit(
+                "creating a public Site requires explicit --confirm-public; capability preflight stopped before creating resources"
+            )
+        arguments = {"display_name": args.display_name, "audience": audience}
+        if not args.audience:
+            arguments["public_publishing"] = bool(recommended.get("publicPublishing"))
+            arguments["forward_identity"] = bool(recommended.get("forwardIdentity"))
         for key in ("scaling_profile", "runtime_class_name"):
             if getattr(args, key):
                 arguments[key] = getattr(args, key)
@@ -1271,66 +1908,81 @@ def main():
         print_json(call_tool("GetSite", {"site_id": selected_site_id(args.site_id)}))
         return
     if args.action == "save-current":
-        arguments = save_version_arguments(args.site_id, {"type": "current_conversation"}, args.build, args.runtime)
-        print_json(call_tool("SaveSiteVersion", arguments))
+        if not args.handoff:
+            raise SystemExit(
+                "save-current requires --handoff from al-sandbox-skill; Site Skill never reads Sandbox conversation state"
+            )
+        source = load_source_handoff(args.handoff)
+        build = normalized_manifest_build(source.get("source_manifest", {}), args.build)
+        runtime = load_json_object(args.runtime)
+        site_id = selected_site_id(args.site_id)
+        plan = plan_site_version(site_id, "SandboxExport", source.get("source_manifest"), build, runtime)
+        build, runtime = normalized_inputs_from_plan(plan, build, runtime)
+        arguments = save_version_arguments(site_id, source, build, runtime, plan=plan)
+        saved = call_tool("SaveSiteVersion", arguments)
+        remove_consumed_handoff_file(args.handoff)
+        print_json({"plan": plan, "version": saved})
         return
     if args.action == "save-git":
         source = {
             "type": "git", "repository": normalize_git_url(args.repository),
             "commit_sha": args.commit_sha, "submodules": args.submodules,
         }
-        arguments = save_version_arguments(args.site_id, source, args.build, args.runtime, args.credential_env)
-        print_json(call_tool("SaveSiteVersion", arguments))
+        build, runtime = load_json_object(args.build), load_json_object(args.runtime)
+        site_id = selected_site_id(args.site_id)
+        plan = plan_site_version(site_id, "GitCommit", None, build, runtime)
+        build, runtime = normalized_inputs_from_plan(plan, build, runtime)
+        arguments = save_version_arguments(site_id, source, build, runtime, args.credential_env, plan=plan)
+        print_json({"plan": plan, "version": call_tool("SaveSiteVersion", arguments)})
         return
     if args.action == "save-oci":
-        print_json(call_tool("SaveSiteVersion", {
-            "site_id": selected_site_id(args.site_id),
+        site_id = selected_site_id(args.site_id)
+        build = {"path_prefix_aware": True} if args.path_prefix_aware else {}
+        plan = plan_site_version(site_id, "OCIImage", None, build, {})
+        print_json({"plan": plan, "version": call_tool("SaveSiteVersion", {
+            "site_id": site_id,
             "source": {"type": "oci", "image_digest": args.image_digest},
-        }))
+            "build": build,
+            "build_plan_revision": str(structured_content(plan).get("profileRevision") or ""),
+        })})
         return
     if args.action in {"save-local", "deploy-local"}:
-        local, saved = save_local_source(args.path, args.site_id, args.build, args.runtime)
+        local, plan, saved = save_local_source(args.path, args.site_id, args.build, args.runtime)
         if args.action == "save-local":
-            print_json({"local_source": local, "version": saved})
+            print_json({"local_source": local, "plan": plan, "version": saved})
             return
         site_id = selected_site_id(args.site_id)
         version_id = result_meta_id(saved, "version_id")
-        ready_version = wait_for(
-            "GetSiteVersion", {"site_id": site_id, "version_id": version_id},
-            args.timeout_seconds, args.interval_seconds, {"ready"}, {"failed"},
-        )
+        ready_version = wait_for_version(site_id, version_id, args.timeout_seconds, args.interval_seconds)
         deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
         deployment_id = result_meta_id(deployment, "deployment_id")
-        ready_deployment = wait_for(
-            "GetSiteDeployment", {"site_id": site_id, "deployment_id": deployment_id},
-            args.deployment_timeout_seconds, args.interval_seconds, {"ready"}, {"failed", "cancelled"},
-        )
-        print_json({"local_source": local, "version": ready_version, "deployment": ready_deployment})
+        ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
+        smoke = smoke_public_deployment(ready_deployment)
+        print_json({"local_source": local, "plan": plan, "version": ready_version, "deployment": ready_deployment, "public_smoke": smoke})
         return
     if args.action in {"save-local-git", "deploy-local-git"}:
         local = inspect_local_git(args.path, args.remote, args.branch, args.skip_remote_check)
-        validate_local_build(local["root"], args.build)
+        build = normalized_local_build(local["root"], args.build)
+        runtime = load_json_object(args.runtime)
         source = {"type": "git", "repository": local["repository"], "commit_sha": local["commit_sha"]}
-        arguments = save_version_arguments(args.site_id, source, args.build, args.runtime, args.credential_env)
+        site_id = selected_site_id(args.site_id)
+        manifest = create_source_manifest(local["root"])
+        plan = plan_site_version(site_id, "GitCommit", manifest, build, runtime)
+        build, runtime = normalized_inputs_from_plan(plan, build, runtime)
+        arguments = save_version_arguments(site_id, source, build, runtime, args.credential_env, plan=plan)
         saved = call_tool("SaveSiteVersion", arguments)
         if args.action == "save-local-git":
-            print_json({"local_git": local, "version": saved})
+            print_json({"local_git": local, "plan": plan, "version": saved})
             return
         site_id = arguments["site_id"]
         version_id = result_meta_id(saved, "version_id")
-        ready_version = wait_for(
-            "GetSiteVersion", {"site_id": site_id, "version_id": version_id},
-            args.timeout_seconds, args.interval_seconds, {"ready"}, {"failed"},
-        )
+        ready_version = wait_for_version(site_id, version_id, args.timeout_seconds, args.interval_seconds)
         deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
         deployment_id = result_meta_id(deployment, "deployment_id")
-        ready_deployment = wait_for(
-            "GetSiteDeployment", {"site_id": site_id, "deployment_id": deployment_id},
-            args.deployment_timeout_seconds, args.interval_seconds, {"ready"}, {"failed", "cancelled"},
-        )
+        ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
         print_json({
-            "local_git": local, "version": ready_version,
-            "deployment": ready_deployment,
+            "local_git": local, "plan": plan, "version": ready_version,
+            "deployment": ready_deployment, "public_smoke": smoke_public_deployment(ready_deployment),
         })
         return
     if args.action == "version":
@@ -1340,10 +1992,7 @@ def main():
         print_json(call_tool("ListSiteVersions", {"site_id": selected_site_id(args.site_id)}))
         return
     if args.action == "wait-version":
-        print_json(wait_for(
-            "GetSiteVersion", {"site_id": selected_site_id(args.site_id), "version_id": args.version_id},
-            args.timeout_seconds, args.interval_seconds, {"ready"}, {"failed"},
-        ))
+        print_json(wait_for_version(selected_site_id(args.site_id), args.version_id, args.timeout_seconds, args.interval_seconds))
         return
     if args.action == "deploy":
         arguments = {"site_id": selected_site_id(args.site_id), "version_id": args.version_id}
@@ -1361,9 +2010,8 @@ def main():
         print_json(call_tool("ListSiteDeployments", {"site_id": selected_site_id(args.site_id)}))
         return
     if args.action == "wait-deployment":
-        print_json(wait_for(
-            "GetSiteDeployment", {"site_id": selected_site_id(args.site_id), "deployment_id": args.deployment_id},
-            args.timeout_seconds, args.interval_seconds, {"ready"}, {"failed", "cancelled"},
+        print_json(wait_for_deployment(
+            selected_site_id(args.site_id), args.deployment_id, args.timeout_seconds, args.interval_seconds,
         ))
 
 
