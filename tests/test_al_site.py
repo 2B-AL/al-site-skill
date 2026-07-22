@@ -107,6 +107,54 @@ class SiteClientTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "credential material"):
                 al_site.create_source_archive(root)
 
+    def test_local_build_resolves_dockerfile_relative_to_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            app = root / "app"
+            app.mkdir()
+            (app / "Dockerfile").write_text(
+                "FROM scratch\nUSER 65532:65532\n", encoding="utf-8"
+            )
+            result = al_site.validate_local_build(
+                root, '{"mode":"dockerfile","context":"app","dockerfile":"Dockerfile"}'
+            )
+            self.assertEqual("app", result["context"])
+            self.assertEqual("Dockerfile", result["dockerfile"])
+            self.assertEqual("65532:65532", result["final_user"])
+
+            with self.assertRaisesRegex(SystemExit, "relative to build.context"):
+                al_site.validate_local_build(
+                    root, '{"mode":"dockerfile","context":"app","dockerfile":"app/Dockerfile"}'
+                )
+
+    def test_local_build_rejects_named_or_root_final_user(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            dockerfile = root / "Dockerfile"
+            dockerfile.write_text(
+                "FROM example AS build\nUSER builder\nFROM example\nUSER nonroot:nonroot\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(SystemExit, "non-numeric USER"):
+                al_site.validate_local_build(root, '{"mode":"dockerfile"}')
+
+            dockerfile.write_text("FROM example\nUSER 0\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "root UID 0"):
+                al_site.validate_local_build(root, '{"mode":"dockerfile"}')
+
+    def test_local_build_auto_allows_railpack_fallback_without_dockerfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = al_site.validate_local_build(directory)
+            self.assertEqual("", result["dockerfile"])
+
+    def test_save_local_build_preflight_runs_before_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "Dockerfile").write_text("FROM example\nUSER nonroot\n", encoding="utf-8")
+            with mock.patch.object(al_site, "post_source_archive") as upload:
+                with self.assertRaisesRegex(SystemExit, "non-numeric USER"):
+                    al_site.save_local_source(root, "site-1", '{"mode":"dockerfile"}')
+            upload.assert_not_called()
+
     def test_save_local_keeps_upload_receipt_in_memory_only(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

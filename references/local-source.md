@@ -41,6 +41,22 @@ python3 scripts/al_site.py deploy-local . \
   --runtime '{"port":8080,"health_path":"/healthz"}'
 ```
 
+`build.dockerfile` 始终相对于 `build.context`。项目结构为 `app/Dockerfile` 时，使用：
+
+```json
+{"mode":"dockerfile","context":"app","dockerfile":"Dockerfile","path_prefix_aware":true}
+```
+
+不要同时写 `context=app` 和 `dockerfile=app/Dockerfile`，否则实际解析路径会变成 `app/app/Dockerfile`。本地命令会在上传前验证解析后的 Dockerfile 确实存在。
+
+Site workload 强制 `runAsNonRoot`。Dockerfile 最终阶段若显式设置用户，使用数字 UID/GID：
+
+```dockerfile
+USER 65532:65532
+```
+
+不要使用 `USER nonroot:nonroot` 等命名用户；kubelet 在启动镜像前不会读取镜像内的 `/etc/passwd` 来证明它不是 root。本地命令会提前拒绝显式的命名用户和 UID 0。若最终阶段没有显式 `USER` 或使用变量，客户端无法证明基础镜像的最终 OCI user，仍应由调用方确保它是数字非 root UID。
+
 ## 发布边界
 
 - `.alignore` 可排除依赖缓存、测试产物和本地大文件。
@@ -48,6 +64,7 @@ python3 scripts/al_site.py deploy-local . \
 - 高置信 private key、AWS key、GitHub token、Slack token 会在客户端和服务端两次拒绝。
 - symlink 必须保持在源目录内；socket、device、FIFO、hardlink archive 等特殊类型被拒绝。
 - 客户端预检用于尽早阻止敏感文件离开本机；服务端规范化和扫描才是权威安全边界。
+- 客户端同时预检 Dockerfile 相对路径和可确定的最终阶段用户；Sandbox export 与纯远端 Git 来源应在提交 `SaveSiteVersion` 前按同一规则检查源码。
 - TOS 只承担短期传输 staging，不是 Site 的业务制品库；完成后唯一持久输入是平台 OCI SourceBundle digest。
 - 同一内容在服务端得到内容寻址的 OCI digest。SiteVersion 只保存 digest 引用，不保存 archive。
 

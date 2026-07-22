@@ -69,6 +69,32 @@ python3 scripts/al_site.py save-local . --site-id SITE_ID
 
 常见原因：commit 未 push、repository URL 只在本机可达、私有仓库没有 importer credential、SSH 缺少固定 `knownHosts`，或 Site 构建网络无法访问远端。
 
+## DockerfileNotFound
+
+`build.dockerfile` 是相对于 `build.context`，不是相对于 SourceBundle 根目录重复计算。例如源码是 `app/Dockerfile`：
+
+```json
+{"mode":"dockerfile","context":"app","dockerfile":"Dockerfile"}
+```
+
+若同时配置 `context=app` 和 `dockerfile=app/Dockerfile`，Build Executor 会查找 `app/app/Dockerfile`。本地发布命令会在上传前给出解析后的缺失路径；Sandbox/Git 来源需要在保存版本前自行核对归档或仓库布局。
+
+## image has non-numeric user
+
+Preview Pod 出现以下错误时：
+
+```text
+container has runAsNonRoot and image has non-numeric user (nonroot), cannot verify user is non-root
+```
+
+将 Dockerfile 最终阶段从命名用户改成数字非 root UID/GID，例如：
+
+```dockerfile
+USER 65532:65532
+```
+
+不要放宽 Site 的 `runAsNonRoot`。本地发布命令会提前拒绝最终阶段中显式的命名 `USER` 或 UID 0；Sandbox/Git 来源仍需在源码侧遵守该约束。
+
 ## 版本或部署一直未 Ready
 
 ```bash

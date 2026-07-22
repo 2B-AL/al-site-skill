@@ -714,6 +714,7 @@ def create_source_archive(path):
 
 
 def save_local_source(path, site_id, build_json="{}", runtime_json="{}"):
+    validate_local_build(path, build_json)
     archive, summary = create_source_archive(path)
     try:
         uploaded = post_source_archive(archive)
@@ -770,6 +771,114 @@ def load_json_object(value):
     if not isinstance(parsed, dict):
         raise SystemExit("arguments must be a JSON object")
     return parsed
+
+
+def source_relative_path(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{field} must be a non-empty SourceBundle-relative path")
+    value = value.strip()
+    if "\\" in value:
+        raise SystemExit(f"{field} must use forward slashes")
+    path = pathlib.PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise SystemExit(f"{field} must stay within the SourceBundle")
+    return path
+
+
+def final_dockerfile_user(path):
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise SystemExit(f"could not read Dockerfile {path}: {error}")
+    instruction = ""
+    final_user = ""
+    for raw in lines:
+        stripped = raw.strip()
+        if not instruction and (not stripped or stripped.startswith("#")):
+            continue
+        continued = raw.rstrip().endswith("\\")
+        instruction += raw.rstrip()[:-1].strip() + " " if continued else raw.strip()
+        if continued:
+            continue
+        parts = instruction.strip().split(None, 1)
+        instruction = ""
+        if not parts:
+            continue
+        keyword = parts[0].upper()
+        value = parts[1].strip() if len(parts) == 2 else ""
+        if keyword == "FROM":
+            final_user = ""
+        elif keyword == "USER":
+            final_user = value
+    return final_user
+
+
+def validate_numeric_final_user(path):
+    user = final_dockerfile_user(path)
+    if not user or "$" in user:
+        return user
+    if not re.fullmatch(r"[0-9]+(?::[0-9]+)?", user):
+        raise SystemExit(
+            f"Dockerfile final stage uses non-numeric USER {user!r}; Site enforces runAsNonRoot and kubelet "
+            "cannot verify named users. Use a numeric UID[:GID], for example USER 65532:65532"
+        )
+    if int(user.split(":", 1)[0]) == 0:
+        raise SystemExit("Dockerfile final stage uses root UID 0; Site requires a numeric non-root USER")
+    return user
+
+
+def validate_local_build(path, build_json="{}"):
+    root = pathlib.Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"local project directory does not exist: {root}")
+    build = load_json_object(build_json)
+    mode = str(build.get("mode") or "auto").strip().lower()
+    if mode not in {"auto", "dockerfile", "railpack"}:
+        raise SystemExit(f"unsupported build.mode {mode!r}")
+    context = source_relative_path(build.get("context") or ".", "build.context")
+    context_path = (root / pathlib.Path(*context.parts)).resolve(strict=False)
+    try:
+        context_path.relative_to(root)
+    except ValueError:
+        raise SystemExit("build.context resolves outside the local project")
+    if not context_path.is_dir():
+        raise SystemExit(f"build.context does not exist or is not a directory: {context.as_posix()!r}")
+    if mode == "railpack":
+        return {"mode": mode, "context": context.as_posix()}
+    dockerfile = source_relative_path(build.get("dockerfile") or "Dockerfile", "build.dockerfile")
+    dockerfile_path = (context_path / pathlib.Path(*dockerfile.parts)).resolve(strict=False)
+    try:
+        dockerfile_path.relative_to(context_path)
+    except ValueError:
+        raise SystemExit("build.dockerfile resolves outside build.context")
+
+    explicit_dockerfile = "dockerfile" in build or mode == "dockerfile"
+    if not dockerfile_path.is_file():
+        if not explicit_dockerfile:
+            return {"mode": mode, "context": context.as_posix(), "dockerfile": ""}
+        suggestion = ""
+        if context.as_posix() != ".":
+            try:
+                relative = dockerfile.relative_to(context)
+            except ValueError:
+                relative = None
+            if relative is not None:
+                suggestion = (
+                    f"; build.dockerfile is relative to build.context, so try {relative.as_posix()!r} "
+                    f"instead of {dockerfile.as_posix()!r}"
+                )
+        resolved = dockerfile_path.relative_to(root).as_posix()
+        raise SystemExit(
+            f"configured Dockerfile does not exist at {resolved!r} "
+            f"(build.context={context.as_posix()!r}, build.dockerfile={dockerfile.as_posix()!r}){suggestion}"
+        )
+    final_user = validate_numeric_final_user(dockerfile_path)
+    return {
+        "mode": mode,
+        "context": context.as_posix(),
+        "dockerfile": dockerfile.as_posix(),
+        "final_user": final_user,
+    }
 
 
 def parse_arg_value(value):
@@ -973,7 +1082,10 @@ def add_site_id(parser):
 
 def add_save_options(parser):
     add_site_id(parser)
-    parser.add_argument("--build", default="{}", help="Build JSON object or @file.json")
+    parser.add_argument(
+        "--build", default="{}",
+        help="Build JSON object or @file.json; dockerfile is relative to build.context",
+    )
     parser.add_argument("--runtime", default="{}", help="Runtime JSON object or @file.json")
 
 
@@ -1197,6 +1309,7 @@ def main():
         return
     if args.action in {"save-local-git", "deploy-local-git"}:
         local = inspect_local_git(args.path, args.remote, args.branch, args.skip_remote_check)
+        validate_local_build(local["root"], args.build)
         source = {"type": "git", "repository": local["repository"], "commit_sha": local["commit_sha"]}
         arguments = save_version_arguments(args.site_id, source, args.build, args.runtime, args.credential_env)
         saved = call_tool("SaveSiteVersion", arguments)

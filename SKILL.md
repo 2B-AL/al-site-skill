@@ -89,6 +89,12 @@ python3 scripts/al_site.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID
 python3 scripts/al_site.py save-oci REGISTRY/REPOSITORY@sha256:DIGEST --site-id SITE_ID
 ```
 
+保存源码版本前必须检查构建契约：
+
+- `build.context` 相对于 SourceBundle 根目录；`build.dockerfile` 再相对于 `build.context`。例如 `context=app` 时使用 `dockerfile=Dockerfile`，不要重复写成 `app/Dockerfile`。
+- Dockerfile 最终阶段显式设置 `USER` 时必须使用数字非 root UID，可使用 `USER 65532:65532`。不要使用 `USER nonroot:nonroot`；kubelet 无法在 `runAsNonRoot` 启动前验证命名用户。
+- `save-local` / `deploy-local` 和本地 Git 命令会自动预检上述规则并在上传或保存版本前失败。`save-current` 无法读取 Sandbox 文件；在创建源码时按同一规则检查 `$context/$dockerfile` 和 Dockerfile 最终阶段。
+
 等待构建并部署：
 
 ```bash
