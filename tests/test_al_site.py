@@ -306,6 +306,16 @@ class SiteClientTest(unittest.TestCase):
                 al_site.create_test_site("test", False, lambda result, site_id, site_uid: recorded.append((site_id, site_uid)))
         self.assertEqual([("created-site", "created-uid")], recorded)
 
+    def test_resource_identity_falls_back_to_structured_metadata(self):
+        result = {
+            "structuredContent": {
+                "metadata": {"name": "created-site", "uid": "created-uid"},
+                "spec": {},
+            }
+        }
+        self.assertEqual("created-site", al_site.result_meta_id(result, "site_id"))
+        self.assertEqual("created-uid", al_site.result_uid(result))
+
     def test_wait_version_uses_cursor_without_restarting_work(self):
         responses = [
             {"structuredContent": {"cursor": "10", "version": {"status": {"phase": "Building", "build": {"state": "Running", "attempt": 1}}}}},
@@ -317,6 +327,44 @@ class SiteClientTest(unittest.TestCase):
             result = al_site.wait_for_version("site-1", "version-1", 30)
         self.assertEqual("Ready", al_site.phase_of(result))
         self.assertEqual("10", call.call_args_list[1].args[1]["cursor"])
+
+    def test_wait_version_recovers_watch_transport_timeout_with_get(self):
+        timeout = SystemExit(
+            '{"code": -32000, "message": "context deadline exceeded '
+            '(Client.Timeout exceeded while awaiting headers)"}'
+        )
+        ready = {"structuredContent": {"status": {"phase": "Ready"}}}
+        with mock.patch.object(al_site, "available_tool_names", return_value={"WatchSiteVersion"}), mock.patch.object(
+            al_site, "call_tool", side_effect=[timeout, ready]
+        ) as call:
+            result = al_site.wait_for_version("site-1", "version-1", 30)
+        self.assertEqual("Ready", al_site.phase_of(result))
+        self.assertEqual("WatchSiteVersion", call.call_args_list[0].args[0])
+        self.assertEqual("GetSiteVersion", call.call_args_list[1].args[0])
+
+    def test_public_smoke_resolves_shared_path_url_from_site(self):
+        deployment = {"structuredContent": {"deployment": {"status": {"phase": "Ready"}}}}
+        site = {"structuredContent": {"status": {"url": "https://site.example/sites/demo/"}}}
+
+        class Response:
+            status = 200
+
+            def read(self, _limit):
+                return b"ok"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with mock.patch.object(al_site, "call_tool", return_value=site) as call, mock.patch.object(
+            al_site.urllib.request, "urlopen", return_value=Response()
+        ):
+            result = al_site.smoke_public_deployment(deployment, "site-1")
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("https://site.example/sites/demo/", result["url"])
+        call.assert_called_once_with("GetSite", {"site_id": "site-1"})
 
     def test_wait_deployment_uses_cursor_until_traffic_ready(self):
         responses = [

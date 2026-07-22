@@ -107,7 +107,12 @@ def load_test_run(value):
 
 def result_uid(result):
     meta = result.get("_meta", {}) if isinstance(result, dict) else {}
-    return str(meta.get("uid") or "").strip()
+    value = str(meta.get("uid") or "").strip()
+    if value:
+        return value
+    structured = structured_content(result)
+    metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
+    return str(metadata.get("uid") or "").strip()
 
 
 def prepare_test_run_destination(destination, run_id):
@@ -1247,6 +1252,10 @@ def result_meta_id(result, key):
     meta = result.get("_meta", {}) if isinstance(result, dict) else {}
     value = str(meta.get(key) or "").strip()
     if not value:
+        structured = structured_content(result)
+        metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
+        value = str(metadata.get("name") or "").strip()
+    if not value:
         raise SystemExit(f"Site MCP response is missing _meta.{key}")
     return value
 
@@ -1335,7 +1344,7 @@ def complete_test_deployment(target, run, site_id, saved, version_timeout, deplo
     deployment_id = result_meta_id(deployment, "deployment_id")
     update_test_run(target, run, "deployment-created", deployment=deployment_id)
     ready_deployment = wait_for_deployment(site_id, deployment_id, deployment_timeout, interval)
-    smoke = smoke_public_deployment(ready_deployment)
+    smoke = smoke_public_deployment(ready_deployment, site_id)
     update_test_run(target, run, "ready")
     return ready_version, ready_deployment, smoke
 
@@ -1405,6 +1414,30 @@ def emit_active_version_log_progress(site_id, version_id, snapshot, cursors):
         return
 
 
+def transient_watch_error(error):
+    message = str(error or "").lower()
+    return any(fragment in message for fragment in (
+        "context deadline exceeded",
+        "client.timeout exceeded",
+        "timeout awaiting response headers",
+        "timed out awaiting response headers",
+        "gateway timeout",
+    ))
+
+
+def watch_or_get(watch_tool, get_tool, arguments, get_arguments):
+    try:
+        return call_tool(watch_tool, arguments)
+    except SystemExit as error:
+        if not transient_watch_error(error):
+            raise
+        print(
+            f"{watch_tool} transport timeout; recovering with {get_tool} without restarting platform work",
+            file=sys.stderr,
+        )
+        return call_tool(get_tool, get_arguments)
+
+
 def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0):
     names = available_tool_names()
     if "WatchSiteVersion" not in names:
@@ -1425,7 +1458,10 @@ def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0)
         }
         if cursor:
             arguments["cursor"] = cursor
-        result = call_tool("WatchSiteVersion", arguments)
+        result = watch_or_get(
+            "WatchSiteVersion", "GetSiteVersion", arguments,
+            {"site_id": site_id, "version_id": version_id},
+        )
         payload = structured_content(result)
         cursor = str(payload.get("cursor") or cursor)
         snapshot = version_stage_snapshot(result)
@@ -1498,7 +1534,10 @@ def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_second
         }
         if cursor:
             arguments["cursor"] = cursor
-        result = call_tool("WatchSiteDeployment", arguments)
+        result = watch_or_get(
+            "WatchSiteDeployment", "GetSiteDeployment", arguments,
+            {"site_id": site_id, "deployment_id": deployment_id},
+        )
         payload = structured_content(result)
         cursor = str(payload.get("cursor") or cursor)
         snapshot = deployment_snapshot(result)
@@ -1561,8 +1600,13 @@ def deployment_public_url(result):
     return ""
 
 
-def smoke_public_deployment(result):
+def smoke_public_deployment(result, site_id=""):
     url = deployment_public_url(result)
+    if not url and site_id:
+        # Shared APIG path routing publishes the canonical public URL on Site
+        # status, while SiteDeployment deliberately exposes only its internal
+        # smoke URL. Resolve the owning Site before declaring smoke N/A.
+        url = deployment_public_url(call_tool("GetSite", {"site_id": site_id}))
     if not url:
         return {"status": "not_applicable", "reason": "deployment exposes no public URL"}
     request = urllib.request.Request(url, headers={"User-Agent": "al-site-skill/1"}, method="GET")
@@ -2015,7 +2059,7 @@ def main():
         deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
         deployment_id = result_meta_id(deployment, "deployment_id")
         ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
-        smoke = smoke_public_deployment(ready_deployment)
+        smoke = smoke_public_deployment(ready_deployment, site_id)
         print_json({"local_source": local, "plan": plan, "version": ready_version, "deployment": ready_deployment, "public_smoke": smoke})
         return
     if args.action in {"save-local-git", "deploy-local-git"}:
@@ -2040,7 +2084,7 @@ def main():
         ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
         print_json({
             "local_git": local, "plan": plan, "version": ready_version,
-            "deployment": ready_deployment, "public_smoke": smoke_public_deployment(ready_deployment),
+            "deployment": ready_deployment, "public_smoke": smoke_public_deployment(ready_deployment, site_id),
         })
         return
     if args.action == "version":
