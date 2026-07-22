@@ -4,7 +4,7 @@
 
 ```text
 local directory
-  -> al-site-skill preflight + deterministic tar.gz
+  -> al-site preflight + deterministic tar.gz
   -> Site MCP JSON control: create multipart session
   -> direct exact-part PUT to short-lived TOS presigned URLs
   -> Site MCP JSON control: status / refresh / complete / abort

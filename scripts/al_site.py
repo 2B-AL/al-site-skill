@@ -1138,7 +1138,7 @@ def load_source_handoff(value):
         raise SystemExit("Sandbox source handoff expires_at is invalid")
     now = datetime.datetime.now(datetime.timezone.utc)
     if expiry.tzinfo is None or expiry <= now:
-        raise SystemExit("Sandbox source handoff has expired; request a fresh handoff from al-sandbox-skill")
+        raise SystemExit("Sandbox source handoff has expired; request a fresh handoff from al-sandbox")
     if expiry <= now + datetime.timedelta(seconds=60):
         raise SystemExit("Sandbox source handoff expires in less than 60 seconds; request a fresh handoff before planning or saving")
     manifest = descriptor.get("source_manifest")
@@ -1609,7 +1609,7 @@ def smoke_public_deployment(result, site_id=""):
         url = deployment_public_url(call_tool("GetSite", {"site_id": site_id}))
     if not url:
         return {"status": "not_applicable", "reason": "deployment exposes no public URL"}
-    request = urllib.request.Request(url, headers={"User-Agent": "al-site-skill/1"}, method="GET")
+    request = urllib.request.Request(url, headers={"User-Agent": "al-site/1"}, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read(1 << 20)
@@ -2012,7 +2012,7 @@ def main():
     if args.action == "save-current":
         if not args.handoff:
             raise SystemExit(
-                "save-current requires --handoff from al-sandbox-skill; Site Skill never reads Sandbox conversation state"
+                "save-current requires --handoff from al-sandbox; Site Skill never reads Sandbox conversation state"
             )
         source = load_source_handoff(args.handoff)
         build = normalized_manifest_build(source.get("source_manifest", {}), args.build)
