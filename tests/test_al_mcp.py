@@ -17,11 +17,13 @@ SPEC.loader.exec_module(al_site)
 
 
 class SiteClientTest(unittest.TestCase):
-    def test_repository_uses_pure_mcp_client_layout(self):
+    def test_repository_uses_mcp_client_with_ui_metadata(self):
         root = pathlib.Path(__file__).parents[1]
         self.assertTrue((root / "scripts" / "al_mcp.py").is_file())
         self.assertFalse((root / "scripts" / "al_site.py").exists())
-        self.assertFalse((root / "agents" / "openai.yaml").exists())
+        metadata = (root / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.assertIn('display_name: "AL Site"', metadata)
+        self.assertIn('default_prompt: "Use $al-site ', metadata)
 
     def test_all_current_tools_have_unique_commands(self):
         commands = [al_site.tool_command_name(name) for name in al_site.SITE_TOOLS]
