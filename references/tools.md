@@ -39,7 +39,8 @@ python3 scripts/al_mcp.py set-site-access-policy \
 | `create` | `CreateSite` |
 | `select` | `SelectSite` |
 | `current` | `GetCurrentSite` |
-| `sites` | `ListSites` |
+| `sites [--relation created\|accessible] [--owner-kind ...] [--phase ...]` | `ListSites`；默认只列出当前用户创建的 Site，并自动遍历分页 |
+| `get [SITE_ID] [--relation created\|accessible]` | `GetSite`；按同一关系做存在性断言 |
 | `save-local` / `deploy-local` | Gateway binary upload + `SaveSiteVersion(source_bundle)` |
 | `save-current --handoff @file` | `PlanSiteVersion` + `SaveSiteVersion(sandbox_handoff)` |
 | `test-deploy-local` / `test-deploy-current` | 创建专用测试 Site，完成 plan/version/deployment/smoke，并写入精确资源清单 |
@@ -52,5 +53,13 @@ python3 scripts/al_mcp.py set-site-access-policy \
 | `archive` | Gateway conversation archive endpoint |
 
 高影响工具不要只依赖快捷入口；调用前使用 `describe` 确认在线 required fields、`resource_version` 和确认字段。
+
+`created` 依据 Site 中持久化的创建者身份，和可为 team/org 的 owner 分离；
+`accessible` 依据当前 user/team/org owner 成员关系，表示调用者拥有 MCP 控制面管理权限。
+public/selected audience、公网 URL 或应用侧访问认证属于数据面，不会授予控制面访问权限。
+两种查询都由服务端按认证身份过滤，客户端不在本地下载全集后筛选。
+查询统一返回 creator、owner、relations、permissions、status、UID、resource version、时间和 details。
+更新必须携带最新 `resource_version`；删除必须携带 `confirm=true`、最新 `expected_uid` 和
+`resource_version`，发生冲突时重新 Get 后再决定是否重试。
 
 `GetSitePlatformCapabilities` 决定当前路由模式允许的 audience、public publishing 和 identity forwarding 组合。客户端必须在创建资源前拒绝不支持的组合，尤其不能把显式 `owner` 静默改成 `public`。`PlanSiteVersion` 是所有源码后端共用的强制 preflight；没有 plan 能力时，强类型发布命令 fail closed。

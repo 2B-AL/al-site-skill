@@ -20,7 +20,8 @@ python3 scripts/al_mcp.py archive
 复制任意一条使用：
 
 ```text
-$al-site 列出我的 Sites。
+$al-site 列出由我创建的 Sites。
+$al-site 列出当前共享给我或我可以访问的 Sites。
 $al-site 创建一个名为 "My Site" 的 Site。
 $al-site 把当前目录部署到我选中的 Site。
 $al-site 查看当前版本的构建、扫描和预览状态。
@@ -34,7 +35,7 @@ $al-site 删除这个 Site；执行前再次确认资源身份。
 
 `al-site` 与 `al-sandbox` 可以分别独立使用。`save-local` 通过 Site MCP 创建短期上传会话，并由客户端把本地归档分片直传 TOS；`save-git` 和 `save-oci` 同样不依赖 Sandbox。只有 `save-current` 显式消费 `al-sandbox handoff` 生成的一次性、owner-bound 描述符。
 
-Site 是持久资源。`archive` 只清除当前 conversation 的 Site 选择，不会暂停或删除 Site；永久删除必须显式调用 `DeleteSite` 并确认。构建和部署完成状态以 MCP 返回的真实 Version/Deployment phase 为准。
+Site 是持久资源。`archive` 只清除当前 conversation 的 Site 选择，不会暂停或删除 Site；永久删除必须显式调用 `DeleteSite`，并携带确认、最新 UID 和 resource version。`sites` 默认只列出调用者创建的 Site，也可按 `relation=accessible` 查询通过 user/team/org owner 成员关系可管理的 Site；public audience 或公网 URL 不属于控制面授权。构建和部署完成状态以 MCP 返回的真实 Version/Deployment phase 为准。
 
 默认使用 dev 公网 Gateway `https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com`。首次调用会自动打开 Gateway `/login`，通过 OAuth PKCE 把短期 token 回传到本机客户端缓存；conversation id 也会自动生成并缓存。其他环境可通过 `configure --gateway-url` 或 `AL_SITE_MCP_GATEWAY_URL` 覆盖。
 

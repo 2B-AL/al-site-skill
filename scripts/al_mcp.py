@@ -111,8 +111,24 @@ def result_uid(result):
     if value:
         return value
     structured = structured_content(result)
+    value = str(structured.get("uid") or "").strip()
+    if value:
+        return value
     metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
     return str(metadata.get("uid") or "").strip()
+
+
+def result_resource_version(result):
+    meta = result.get("_meta", {}) if isinstance(result, dict) else {}
+    value = str(meta.get("resourceVersion") or meta.get("resource_version") or "").strip()
+    if value:
+        return value
+    structured = structured_content(result)
+    value = str(structured.get("resource_version") or structured.get("resourceVersion") or "").strip()
+    if value:
+        return value
+    metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
+    return str(metadata.get("resourceVersion") or metadata.get("resource_version") or "").strip()
 
 
 def prepare_test_run_destination(destination, run_id):
@@ -885,6 +901,46 @@ def structured_content(result):
     return {}
 
 
+def site_page(result):
+    structured = structured_content(result)
+    if not isinstance(structured.get("items"), list):
+        raise SystemExit("ListSites did not return structuredContent.items")
+    return structured["items"], str(structured.get("next_token") or "").strip()
+
+
+def list_all_sites(relation="created", phases=None, owner_kind="", owner_id="", page_size=100):
+    items = []
+    next_token = ""
+    seen_tokens = set()
+    pages = 0
+    while True:
+        arguments = {"relation": relation, "limit": page_size}
+        if phases:
+            arguments["phases"] = list(phases)
+        if owner_kind:
+            arguments["owner_kind"] = owner_kind
+        if owner_id:
+            arguments["owner_id"] = owner_id
+        if next_token:
+            arguments["next_token"] = next_token
+        page_items, returned_token = site_page(call_tool("ListSites", arguments))
+        items.extend(page_items)
+        pages += 1
+        if not returned_token:
+            break
+        if returned_token in seen_tokens:
+            raise SystemExit("ListSites returned a repeated next_token")
+        if pages >= 100:
+            raise SystemExit("ListSites exceeded the 100-page safety limit")
+        seen_tokens.add(returned_token)
+        next_token = returned_token
+    return {
+        "content": [{"type": "text", "text": f"Listed {len(items)} Site control-plane resource(s)."}],
+        "structuredContent": {"items": items, "count": len(items)},
+        "_meta": {"relation": relation, "read_only": True, "pages": pages, "complete": True},
+    }
+
+
 def platform_capabilities(required=True):
     if "GetSitePlatformCapabilities" not in available_tool_names():
         if required:
@@ -1251,6 +1307,9 @@ def selected_site_id(explicit=""):
 def result_meta_id(result, key):
     meta = result.get("_meta", {}) if isinstance(result, dict) else {}
     value = str(meta.get(key) or "").strip()
+    if not value:
+        structured = structured_content(result)
+        value = str(structured.get("id") or "").strip()
     if not value:
         structured = structured_content(result)
         metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
@@ -1767,9 +1826,15 @@ def build_parser():
     select = sub.add_parser("select")
     select.add_argument("site_id")
     sub.add_parser("current")
-    sub.add_parser("sites")
+    sites = sub.add_parser("sites")
+    sites.add_argument("--relation", choices=("created", "accessible"), default="created")
+    sites.add_argument("--phase", action="append", default=[], dest="phases")
+    sites.add_argument("--owner-kind", choices=("user", "team", "org"), default="")
+    sites.add_argument("--owner-id", default="")
+    sites.add_argument("--page-size", type=int, choices=range(1, 101), default=100, metavar="1..100")
     get = sub.add_parser("get")
     get.add_argument("site_id", nargs="?", default="")
+    get.add_argument("--relation", choices=("created", "accessible"), default="created")
 
     save_current = sub.add_parser("save-current")
     save_current.add_argument("--handoff", default="", help="Explicit one-time Sandbox handoff JSON or @file.json")
@@ -1917,7 +1982,15 @@ def main():
         current_uid = result_uid(current)
         if not current_uid or current_uid != run["site_uid"]:
             raise SystemExit("refusing test cleanup: the current Site UID does not match the recorded test Site UID")
-        deleted = call_tool("DeleteSite", {"site_id": run["site_id"], "confirm": True, "expected_uid": run["site_uid"]})
+        resource_version = result_resource_version(current)
+        if not resource_version:
+            raise SystemExit("refusing test cleanup: GetSite did not return the latest resource_version")
+        deleted = call_tool("DeleteSite", {
+            "site_id": run["site_id"],
+            "confirm": True,
+            "expected_uid": run["site_uid"],
+            "resource_version": resource_version,
+        })
         update_test_run(target, run, "deletion-requested")
         print_json({"run_file": str(target), "site_id": run["site_id"], "deletion": deleted})
         return
@@ -2004,10 +2077,10 @@ def main():
         print_json(call_tool("GetCurrentSite", {}))
         return
     if args.action == "sites":
-        print_json(call_tool("ListSites", {}))
+        print_json(list_all_sites(args.relation, args.phases, args.owner_kind, args.owner_id, args.page_size))
         return
     if args.action == "get":
-        print_json(call_tool("GetSite", {"site_id": selected_site_id(args.site_id)}))
+        print_json(call_tool("GetSite", {"site_id": selected_site_id(args.site_id), "relation": args.relation}))
         return
     if args.action == "save-current":
         if not args.handoff:

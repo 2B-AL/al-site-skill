@@ -31,6 +31,9 @@ class SiteClientTest(unittest.TestCase):
         args = parser.parse_args(["get-site-events", "--arg", "site_id=example"])
         self.assertEqual("GetSiteEvents", args.site_tool)
         self.assertEqual("test-deploy-current", parser.parse_args(["test-deploy-current", "--handoff", "@handoff.json"]).action)
+        self.assertEqual("created", parser.parse_args(["sites"]).relation)
+        self.assertEqual("accessible", parser.parse_args(["sites", "--relation", "accessible"]).relation)
+        self.assertEqual("accessible", parser.parse_args(["get", "shared", "--relation", "accessible"]).relation)
 
     def test_gateway_url_validation(self):
         self.assertEqual("https://gateway.example", al_site.validate_gateway_url("https://gateway.example/mcp"))
@@ -45,6 +48,30 @@ class SiteClientTest(unittest.TestCase):
             al_site, "load_state", return_value={}
         ):
             self.assertEqual(al_site.DEFAULT_GATEWAY_URL, al_site.configured_gateway_url())
+
+    def test_relation_shortcuts_forward_explicit_filters_and_paginate(self):
+        responses = [
+            {"structuredContent": {"items": [{"id": "site-1"}], "next_token": "next-1"}},
+            {"structuredContent": {"items": [{"id": "site-2"}]}},
+        ]
+        with mock.patch("sys.argv", [
+            "al_mcp.py", "sites", "--relation", "accessible", "--owner-kind", "team",
+            "--owner-id", "team-1", "--phase", "Ready", "--page-size", "25",
+        ]), mock.patch.object(al_site, "call_tool", side_effect=responses) as call, mock.patch.object(
+            al_site, "print_json"
+        ) as output:
+            al_site.main()
+        self.assertEqual([
+            mock.call("ListSites", {"relation": "accessible", "limit": 25, "phases": ["Ready"], "owner_kind": "team", "owner_id": "team-1"}),
+            mock.call("ListSites", {"relation": "accessible", "limit": 25, "phases": ["Ready"], "owner_kind": "team", "owner_id": "team-1", "next_token": "next-1"}),
+        ], call.call_args_list)
+        self.assertEqual(2, output.call_args.args[0]["structuredContent"]["count"])
+
+        with mock.patch("sys.argv", ["al_mcp.py", "get", "site-1"]), mock.patch.object(
+            al_site, "call_tool", return_value={}
+        ) as call, mock.patch.object(al_site, "print_json"):
+            al_site.main()
+        call.assert_called_once_with("GetSite", {"site_id": "site-1", "relation": "created"})
 
     def test_argument_merge_parses_json(self):
         value = al_site.merge_call_arguments('{"site_id":"a"}', ["confirm=true", "step=2", 'users=["u"]'])
@@ -321,6 +348,28 @@ class SiteClientTest(unittest.TestCase):
         }
         self.assertEqual("created-site", al_site.result_meta_id(result, "site_id"))
         self.assertEqual("created-uid", al_site.result_uid(result))
+
+    def test_resource_identity_reads_unified_resource_view(self):
+        result = {"structuredContent": {"id": "site-view", "uid": "uid-view", "resource_version": "42"}}
+        self.assertEqual("site-view", al_site.result_meta_id(result, "site_id"))
+        self.assertEqual("uid-view", al_site.result_uid(result))
+        self.assertEqual("42", al_site.result_resource_version(result))
+
+    def test_cleanup_requires_latest_resource_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target, _ = al_site.new_test_run(
+                "site-test", "uid-test", "local", pathlib.Path(directory) / "run.json",
+                "33333333-3333-3333-3333-333333333333",
+            )
+            current = {"structuredContent": {"id": "site-test", "uid": "uid-test", "resource_version": "77"}}
+            with mock.patch("sys.argv", ["al_mcp.py", "cleanup-test-run", str(target), "--confirm"]), mock.patch.object(
+                al_site, "call_tool", side_effect=[current, {"structuredContent": {"deleted": True}}]
+            ) as call, mock.patch.object(al_site, "print_json"):
+                al_site.main()
+            self.assertEqual(
+                mock.call("DeleteSite", {"site_id": "site-test", "confirm": True, "expected_uid": "uid-test", "resource_version": "77"}),
+                call.call_args_list[1],
+            )
 
     def test_wait_version_uses_cursor_without_restarting_work(self):
         responses = [
