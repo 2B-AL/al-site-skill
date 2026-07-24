@@ -36,6 +36,7 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual("created", parser.parse_args(["sites"]).relation)
         self.assertEqual("accessible", parser.parse_args(["sites", "--relation", "accessible"]).relation)
         self.assertEqual("accessible", parser.parse_args(["get", "shared", "--relation", "accessible"]).relation)
+        self.assertEqual("delete-version", parser.parse_args(["delete-version", "version-1", "--confirm"]).action)
 
     def test_gateway_url_validation(self):
         self.assertEqual("https://gateway.example", al_site.validate_gateway_url("https://gateway.example/mcp"))
@@ -421,7 +422,115 @@ class SiteClientTest(unittest.TestCase):
             result = al_site.smoke_public_deployment(deployment, "site-1")
         self.assertEqual("passed", result["status"])
         self.assertEqual("https://site.example/sites/demo/", result["url"])
-        call.assert_called_once_with("GetSite", {"site_id": "site-1"})
+        call.assert_called_once_with("GetSite", {"site_id": "site-1", "relation": "accessible"})
+
+    def test_release_options_are_shared_and_build_typed_strategy(self):
+        parser = al_site.build_parser()
+        for command in ("release", "deploy-local", "deploy-local-git", "test-deploy-local", "test-deploy-current"):
+            prefix = [command]
+            if command == "release":
+                prefix.append("version-1")
+            elif command == "test-deploy-current":
+                prefix.extend(["--handoff", "@handoff.json"])
+            args = parser.parse_args(prefix + [
+                "--canary", "5,25,100", "--lane-header", "X-AL-Site-Lane=beta",
+                "--max-error-rate", "0.01", "--min-requests", "100",
+            ])
+            strategy = al_site.release_strategy_from_args(args)
+            self.assertEqual("canary", strategy["type"])
+            self.assertEqual([5, 25, 100], [step["percent"] for step in strategy["steps"]])
+            self.assertEqual(0.01, strategy["steps"][0]["metric_gate"]["max_error_rate"])
+            self.assertEqual("X-AL-Site-Lane", strategy["lanes"][0]["header"]["name"])
+
+    def test_blue_green_wait_candidate_adds_protected_preview_lane(self):
+        args = al_site.build_parser().parse_args(["release", "version-1", "--blue-green", "--wait-candidate"])
+        strategy = al_site.release_strategy_from_args(args)
+        self.assertEqual("signed-cookie", strategy["lanes"][0]["mode"])
+        self.assertEqual("preview", strategy["lanes"][0]["name"])
+
+    def test_delete_version_reads_and_forwards_exact_identity(self):
+        current = {"structuredContent": {"metadata": {"uid": "version-uid", "resourceVersion": "77"}}}
+        deleted = {"structuredContent": {"deleted": True}}
+        with mock.patch("sys.argv", ["al_mcp.py", "delete-version", "version-1", "--site-id", "site-1", "--confirm"]), mock.patch.object(
+            al_site, "call_tool", side_effect=[current, deleted]
+        ) as call, mock.patch.object(al_site, "print_json"):
+            al_site.main()
+        self.assertEqual(mock.call("GetSiteVersion", {"site_id": "site-1", "version_id": "version-1"}), call.call_args_list[0])
+        self.assertEqual(mock.call("DeleteSiteVersion", {
+            "site_id": "site-1", "version_id": "version-1", "expected_uid": "version-uid",
+            "resource_version": "77", "confirm": True,
+        }), call.call_args_list[1])
+
+    def test_wait_release_long_polls_deployment_between_status_reads(self):
+        building = {"structuredContent": {"phase": "Canary", "state": "Canary", "traffic": {"candidatePercent": 5}}}
+        watched = {"structuredContent": {"cursor": "44", "deployment": {"status": {"phase": "Ready"}}}}
+        ready = {"structuredContent": {"phase": "Ready", "state": "Ready", "terminal": True}}
+        with mock.patch.object(al_site, "available_tool_names", return_value={"GetSiteReleaseStatus", "WatchSiteDeployment"}), mock.patch.object(
+            al_site, "call_tool", side_effect=[building, watched, ready]
+        ) as call:
+            result, paused = al_site.wait_for_release("site-1", "deployment-1", 30)
+        self.assertFalse(paused)
+        self.assertIs(result, ready)
+        self.assertEqual("WatchSiteDeployment", call.call_args_list[1].args[0])
+
+    def test_wait_candidate_requires_published_routing_revision(self):
+        unpublished = {"structuredContent": {
+            "phase": "Canary", "state": "Canary",
+            "candidate": {"revisionName": "candidate-1", "upstream": "http://candidate"},
+            "traffic": {"candidatePercent": 0, "routingEpoch": 7},
+        }}
+        published = {"structuredContent": {
+            "phase": "Canary", "state": "Canary",
+            "candidate": {"revisionName": "candidate-1", "upstream": "http://candidate"},
+            "traffic": {"candidatePercent": 0, "routingEpoch": 7, "routingRevision": "projection-1"},
+        }}
+        with mock.patch.object(al_site, "available_tool_names", return_value={"GetSiteReleaseStatus"}), mock.patch.object(
+            al_site, "call_tool", side_effect=[unpublished, published]
+        ) as call, mock.patch.object(al_site.time, "sleep"):
+            result, paused = al_site.wait_for_release("site-1", "deployment-1", 30, candidate_only=True)
+        self.assertFalse(paused)
+        self.assertIs(result, published)
+        self.assertEqual(2, call.call_count)
+
+    def test_resume_forwards_explicit_timeout_extension_with_current_preconditions(self):
+        status = {"structuredContent": {
+            "phase": "Paused", "currentStep": 2,
+            "traffic": {"routingEpoch": 17},
+        }}
+        resumed = {"structuredContent": {"accepted": True}}
+        with mock.patch("sys.argv", [
+            "al_mcp.py", "resume", "deployment-1", "--site-id", "site-1", "--extend-timeout", "10m",
+        ]), mock.patch.object(al_site, "call_tool", side_effect=[status, resumed]) as call, mock.patch.object(
+            al_site, "print_json"
+        ):
+            al_site.main()
+        self.assertEqual(mock.call("GetSiteReleaseStatus", {
+            "site_id": "site-1", "deployment_id": "deployment-1",
+        }), call.call_args_list[0])
+        self.assertEqual(mock.call("ResumeSiteDeployment", {
+            "site_id": "site-1", "deployment_id": "deployment-1", "expected_step": 2,
+            "expected_phase": "Paused", "expected_routing_epoch": 17, "extend_timeout": "10m",
+        }), call.call_args_list[1])
+
+    def test_release_always_plans_and_pins_plan_revision(self):
+        args = al_site.build_parser().parse_args(["release", "version-1", "--immediate"])
+        plan = {"structuredContent": {"valid": True, "planRevision": "signed-plan"}}
+        deployed = {"_meta": {"deployment_id": "deployment-1"}}
+        with mock.patch.object(al_site, "available_tool_names", return_value={
+            "GetSitePlatformCapabilities", "PlanSiteDeployment", "DeploySiteVersion", "GetSiteReleaseStatus",
+        }), mock.patch.object(al_site, "platform_capabilities", return_value={"release": {"strategies": ["immediate"]}}), mock.patch.object(
+            al_site, "call_tool", return_value=plan
+        ) as planned, mock.patch.object(al_site, "call_tool_result", return_value=deployed) as release:
+            returned_plan, returned_deployment = al_site.create_release(args, "site-1", "version-1")
+        self.assertIs(returned_plan, plan)
+        self.assertIs(returned_deployment, deployed)
+        self.assertEqual("PlanSiteDeployment", planned.call_args.args[0])
+        self.assertEqual("signed-plan", release.call_args.args[1]["plan_revision"])
+
+    def test_custom_scaling_requires_complete_policy(self):
+        args = al_site.build_parser().parse_args(["scaling-apply", "--profile", "custom", "--min-scale", "1"])
+        with self.assertRaisesRegex(SystemExit, "custom scaling requires"):
+            al_site.scaling_policy_from_args(args)
 
     def test_wait_deployment_uses_cursor_until_traffic_ready(self):
         responses = [

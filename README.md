@@ -1,42 +1,96 @@
 # al-site-skill
 
-`al-site` 是 AL Site 系统的客户端 skill。仓库根目录就是可安装 skill，安装后通过 `scripts/al_mcp.py` 调用公网 `al-site-mcp-gateway`，覆盖 Site、不可变 Version、Deployment、访问策略、域名、日志、指标、Add-on 和清理等能力。
+`al-site` 是一个纯 Site MCP 客户端 Skill。它通过 `scripts/al_mcp.py` 使用公网 Site MCP Gateway，不安装 MCP Server，也不依赖 Kubernetes、Knative、VMP 或 `al-sandbox`。同一个 Skill 覆盖源码保存、不可变版本、完整发布策略、灰度验收、回滚、指标和弹性。
 
 ## 快速开始
 
 ```bash
-python3 scripts/al_mcp.py tools
-python3 scripts/al_mcp.py describe CreateSite
-python3 scripts/al_mcp.py call GetCurrentSite
+python3 scripts/al_mcp.py tools --names
+python3 scripts/al_mcp.py call GetSitePlatformCapabilities
+python3 scripts/al_mcp.py sites
 python3 scripts/al_mcp.py create "My Site"
-python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID
-python3 scripts/al_mcp.py wait-version VERSION_ID --site-id SITE_ID
-python3 scripts/al_mcp.py wait-deployment DEPLOYMENT_ID --site-id SITE_ID
-python3 scripts/al_mcp.py archive
+python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID --immediate
 ```
 
-## 示例 Prompt
+首次调用会通过 Gateway `/login` 完成 OAuth Authorization Code + PKCE，并在本机缓存短期 token。默认 dev Gateway 可通过 `configure --gateway-url` 或 `AL_SITE_MCP_GATEWAY_URL` 覆盖。Site Access Gateway、用户 Site URL 和 APIG Ingress 占位 host 都不能代替 MCP Gateway。
 
-复制任意一条使用：
+## 版本与发布
 
-```text
-$al-site 列出由我创建的 Sites。
-$al-site 列出当前共享给我或我可以访问的 Sites。
-$al-site 创建一个名为 "My Site" 的 Site。
-$al-site 把当前目录部署到我选中的 Site。
-$al-site 查看当前版本的构建、扫描和预览状态。
-$al-site 把指定的 Ready Version 部署到生产流量。
-$al-site 查看 Site 的日志、事件和指标。
-$al-site 使用 al-sandbox 生成的一次性 handoff 发布当前项目。
-$al-site 删除这个 Site；执行前再次确认资源身份。
+```bash
+# 版本历史与差异
+python3 scripts/al_mcp.py versions --site-id SITE_ID
+python3 scripts/al_mcp.py version-diff VERSION_A VERSION_B --site-id SITE_ID
+python3 scripts/al_mcp.py delete-version VERSION_ID --site-id SITE_ID --confirm
+
+# Immediate
+python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID --immediate --wait
+
+# Blue-Green：候选 0%，真实公网 signed-lane 验收后再 Promote
+python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID \
+  --blue-green --wait-candidate
+python3 scripts/al_mcp.py promote DEPLOYMENT_ID --site-id SITE_ID --confirm
+
+# Canary：5% -> 25% -> 100%，用 VMP 指标自动判定
+python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID \
+  --canary 5,25,100 --step-duration 5m \
+  --min-requests 100 --max-error-rate 0.01 \
+  --max-p95-ms 1000 --failure-action rollback --wait
 ```
 
-工具面以 MCP Server 的 `tools/list` 为准。脚本保留常见生命周期 shortcut，同时允许通过 `describe <tool>` 和 `call <tool> --arguments ...` 或 `--arg key=value` 调用任意动态工具；当前内置的 Site MCP 工具另有同名 kebab-case 命令。服务端新增工具不要求同步客户端，直接通过通用 `call` 即可使用。
+所有生产流量变化都先调用 `PlanSiteDeployment`，再携带短期 `plan_revision` 创建不可变 SiteDeployment。`deploy-local`、`deploy-local-git`、`test-deploy-local`、`test-deploy-current` 和 `release` 共用同一套 release options，不再有绕过 Plan 的 Immediate 快捷路径。
 
-`al-site` 与 `al-sandbox` 可以分别独立使用。`save-local` 通过 Site MCP 创建短期上传会话，并由客户端把本地归档分片直传 TOS；`save-git` 和 `save-oci` 同样不依赖 Sandbox。只有 `save-current` 显式消费 `al-sandbox handoff` 生成的一次性、owner-bound 描述符。
+## Header 与 Signed Lane
 
-Site 是持久资源。`archive` 只清除当前 conversation 的 Site 选择，不会暂停或删除 Site；永久删除必须显式调用 `DeleteSite`，并携带确认、最新 UID 和 resource version。`sites` 默认只列出调用者创建的 Site，也可按 `relation=accessible` 查询通过 user/team/org owner 成员关系可管理的 Site；public audience 或公网 URL 不属于控制面授权。构建和部署完成状态以 MCP 返回的真实 Version/Deployment phase 为准。
+```bash
+python3 scripts/al_mcp.py release VERSION_ID --blue-green \
+  --signed-lane beta --wait-candidate
+python3 scripts/al_mcp.py open-lane DEPLOYMENT_ID beta --open-browser
 
-默认使用 dev 公网 Gateway `https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com`。首次调用会自动打开 Gateway `/login`，通过 OAuth PKCE 把短期 token 回传到本机客户端缓存；conversation id 也会自动生成并缓存。其他环境可通过 `configure --gateway-url` 或 `AL_SITE_MCP_GATEWAY_URL` 覆盖。
+python3 scripts/al_mcp.py release VERSION_ID --canary 5,25,100 \
+  --lane-header X-AL-Site-Lane=beta --wait-candidate
+```
 
-详细说明见 `SKILL.md` 和 `references/`。
+Header Key 必须来自平台 capability allowlist，Value 由每次发布指定并做 exact match。Public Header 只是路由条件，不是认证。Signed Lane 使用一次性 fragment grant 换取 HttpOnly Cookie。`--wait-candidate` 会通过真实 Site 公网 URL 请求，并验证 Gateway 返回 `X-AL-Site-Target: candidate`。
+
+## 发布动作与回滚
+
+```bash
+python3 scripts/al_mcp.py release-status DEPLOYMENT_ID --watch
+python3 scripts/al_mcp.py pause DEPLOYMENT_ID
+python3 scripts/al_mcp.py resume DEPLOYMENT_ID
+# 如果暂停期间原 step timeout 已经过期，必须明确延长或改为 rollback
+python3 scripts/al_mcp.py resume DEPLOYMENT_ID --extend-timeout 10m
+python3 scripts/al_mcp.py cancel DEPLOYMENT_ID --confirm
+python3 scripts/al_mcp.py rollback HISTORICAL_DEPLOYMENT_ID --confirm --wait
+```
+
+客户端会先读取最新 step、phase、routing epoch、UID 和 resource version。Rollback 会先返回当前/目标差异、历史 Revision 和 migration 风险，再创建新的不可变 Deployment；数据库和 Add-on 数据永远不会随应用流量回滚。
+
+## 弹性
+
+```bash
+python3 scripts/al_mcp.py scaling-status
+python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
+python3 scripts/al_mcp.py scaling-apply --profile latency --wait
+python3 scripts/al_mcp.py scaling-apply --profile custom \
+  --min-scale 1 --max-scale 20 --target-concurrency 20 --wait
+```
+
+`scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。
+
+## 独立与组合使用
+
+- 独立 Site：`save-local`、`save-git`、`save-oci` 和全部发布/弹性命令不依赖 Sandbox。
+- 独立 Sandbox：`al-sandbox` 不依赖 Site。
+- 组合模式：`al-sandbox handoff` 生成一次性 owner-bound 描述符，`save-current --handoff @file` 精确消费项目 SourceBundle。两个 Skill 的 token、conversation 和 state 互不读取。
+
+## 安全与状态
+
+- `tools/list` 和在线 capability 是唯一运行时契约。
+- SiteVersion/SiteDeployment 不可变；不要修改历史模拟更新。
+- public、100% promote、rollback、lane revoke、当前弹性变化和删除需要明确意图。
+- 自动回滚遇到未声明向后兼容的 migration 会暂停，不会冒险切回旧应用。
+- `archive` 只清除 conversation 选择，不删除 Site。
+- 需要人工动作的 Paused 以 JSON 输出并使用退出码 `3`；失败使用其他非零退出码。
+
+完整 Agent 约定见 [SKILL.md](SKILL.md)。策略、Lane、弹性、版本与排障分别见 [references/release.md](references/release.md)、[references/lanes.md](references/lanes.md)、[references/scaling.md](references/scaling.md)、[references/versions.md](references/versions.md) 和 [references/troubleshooting.md](references/troubleshooting.md)。

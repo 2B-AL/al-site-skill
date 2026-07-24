@@ -18,6 +18,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import http.cookiejar
 import urllib.parse
 import urllib.request
 import uuid
@@ -34,9 +35,11 @@ TEST_RUNS_DIR = STATE_DIR / "test-runs"
 SITE_TOOLS = (
     "GetSitePlatformCapabilities", "CreateSite", "SelectSite", "GetCurrentSite", "GetSite", "ListSites", "UpdateSite",
     "PlanSiteVersion", "SaveSiteVersion", "GetSiteVersion", "WatchSiteVersion", "GetSiteVersionLogs",
-    "CancelSiteVersion", "ListSiteVersions", "DeleteSiteVersion",
-    "DeploySiteVersion", "GetSiteDeployment", "WatchSiteDeployment", "ListSiteDeployments", "PromoteSiteDeployment",
-    "RollbackSite", "CancelSiteDeployment", "PauseSiteDeployment", "GetSiteAccessPolicy",
+    "CancelSiteVersion", "ListSiteVersions", "DeleteSiteVersion", "CompareSiteVersions",
+    "PlanSiteDeployment", "DeploySiteVersion", "GetSiteDeployment", "GetSiteReleaseStatus", "WatchSiteDeployment",
+    "ListSiteDeployments", "CreateSiteLaneSession", "RevokeSiteLaneSessions", "PromoteSiteDeployment",
+    "RollbackSite", "CancelSiteDeployment", "PauseSiteDeployment", "ResumeSiteDeployment",
+    "PlanSiteScaling", "UpdateSiteScaling", "GetSiteScaling", "GetSiteAccessPolicy",
     "SetSiteAccessPolicy", "SetSiteGovernance", "SubmitSiteAppeal", "SetSiteDomain",
     "ListSiteDomains", "VerifySiteDomain", "DeleteSiteDomain", "GetSiteLogs", "GetSiteEvents",
     "GetSiteMetrics", "GetSiteUsage", "AttachSiteAddonBinding", "DetachSiteAddonBinding",
@@ -952,6 +955,154 @@ def platform_capabilities(required=True):
     return structured_content(call_tool("GetSitePlatformCapabilities", {}))
 
 
+def require_tools(*names):
+    available = available_tool_names()
+    missing = [name for name in names if name not in available]
+    if missing:
+        raise SystemExit(
+            "Site MCP is missing required release tools: " + ", ".join(missing) +
+            "; deploy a matching al-site Manager and al-site-tools-mcp before continuing"
+        )
+
+
+def parse_canary_percentages(value):
+    try:
+        percentages = [int(item.strip()) for item in str(value or "").split(",") if item.strip()]
+    except ValueError:
+        raise SystemExit("--canary must be a comma-separated list of integer percentages")
+    if not percentages or percentages[-1] != 100 or any(
+        item < 0 or item > 100 or index and item <= percentages[index - 1]
+        for index, item in enumerate(percentages)
+    ):
+        raise SystemExit("--canary percentages must strictly increase between 0 and 100 and end at 100")
+    return percentages
+
+
+def metric_gate_from_args(args):
+    mapping = {
+        "min_requests": "min_requests",
+        "max_error_rate": "max_error_rate",
+        "max_error_rate_increase": "max_error_rate_increase",
+        "max_p95_ms": "max_p95_latency_millis",
+        "max_p95_ratio": "max_p95_latency_ratio",
+        "compare_to_stable": "compare_to_stable",
+        "max_activation_errors": "max_activation_errors",
+    }
+    gate = {}
+    for source, target in mapping.items():
+        value = getattr(args, source, None)
+        if source == "compare_to_stable" and not value:
+            continue
+        if value is not None:
+            gate[target] = value
+    if gate:
+        gate["missing_data_policy"] = getattr(args, "missing_data", "wait")
+    return gate
+
+
+def release_strategy_from_args(args):
+    canary = str(getattr(args, "canary", "") or "").strip()
+    strategy_type = "canary" if canary else "blue-green" if getattr(args, "blue_green", False) else "immediate"
+    strategy = {"type": strategy_type}
+    if strategy_type == "canary":
+        gate = metric_gate_from_args(args)
+        strategy["steps"] = []
+        for percent in parse_canary_percentages(canary):
+            step = {
+                "percent": percent,
+                "duration": getattr(args, "step_duration", "5m"),
+                "timeout": getattr(args, "step_timeout", "30m"),
+                "failure_action": getattr(args, "failure_action", "rollback"),
+            }
+            if getattr(args, "manual_approval", False):
+                step["manual_approval"] = True
+            if gate:
+                step["metric_gate"] = dict(gate)
+            strategy["steps"].append(step)
+    sticky = getattr(args, "sticky", True)
+    strategy["routing"] = {"stickiness": {
+        "enabled": bool(sticky), "ttl_seconds": int(getattr(args, "sticky_ttl_seconds", 86400)),
+    }}
+    lanes = []
+    for name in getattr(args, "signed_lane", []) or []:
+        lanes.append({
+            "name": name, "mode": "signed-cookie", "target": "candidate",
+            "ttl_seconds": int(getattr(args, "lane_ttl_seconds", 900)),
+        })
+    for index, matcher in enumerate(getattr(args, "lane_header", []) or [], start=1):
+        if "=" not in matcher:
+            raise SystemExit("--lane-header must use HEADER=EXACT_VALUE")
+        header, exact = (part.strip() for part in matcher.split("=", 1))
+        if not header or not exact:
+            raise SystemExit("--lane-header requires a non-empty header key and exact value")
+        lanes.append({
+            "name": f"header-{index}", "mode": "public-header", "target": "candidate",
+            "header": {"name": header, "exact": exact},
+        })
+    if strategy_type == "blue-green" and getattr(args, "wait_candidate", False) and not lanes:
+        lanes.append({
+            "name": "preview", "mode": "signed-cookie", "target": "candidate",
+            "ttl_seconds": int(getattr(args, "lane_ttl_seconds", 900)),
+        })
+    if lanes:
+        if strategy_type == "immediate":
+            raise SystemExit("release lanes require --blue-green or --canary")
+        strategy["lanes"] = lanes
+    return strategy
+
+
+def release_arguments(args, site_id, version_id):
+    arguments = {"site_id": site_id, "version_id": version_id, "strategy": release_strategy_from_args(args)}
+    runtime = load_json_object(getattr(args, "release_runtime", "{}"))
+    if runtime:
+        arguments["runtime"] = runtime
+    return arguments
+
+
+def plan_site_release(arguments):
+    require_tools("GetSitePlatformCapabilities", "PlanSiteDeployment", "DeploySiteVersion", "GetSiteReleaseStatus")
+    capabilities = platform_capabilities()
+    release = capabilities.get("release") if isinstance(capabilities.get("release"), dict) else {}
+    strategy_type = str(arguments.get("strategy", {}).get("type") or "immediate")
+    supported = release.get("strategies") if isinstance(release.get("strategies"), list) else []
+    if supported and strategy_type not in supported:
+        raise SystemExit(f"release strategy {strategy_type!r} is not supported by this environment")
+    plan = call_tool("PlanSiteDeployment", arguments)
+    payload = structured_content(plan)
+    if not payload.get("valid"):
+        raise SystemExit("Site release preflight failed:\n" + json.dumps(payload.get("errors") or [], ensure_ascii=False, indent=2))
+    warnings = payload.get("warnings") or []
+    if warnings:
+        print("Site release preflight warnings: " + json.dumps(warnings, ensure_ascii=False), file=sys.stderr)
+    return plan
+
+
+def deploy_planned_release(arguments, plan):
+    plan_revision = str(structured_content(plan).get("planRevision") or plan.get("_meta", {}).get("plan_revision") or "").strip()
+    if not plan_revision:
+        raise SystemExit("PlanSiteDeployment returned no plan_revision; refusing to change traffic")
+    deploy_arguments = dict(arguments, plan_revision=plan_revision)
+    result = call_tool_result("DeploySiteVersion", deploy_arguments)
+    if isinstance(result, dict) and result.get("isError"):
+        code = str(result.get("_meta", {}).get("error_code") or "")
+        if code in {"DeploymentPlanStale", "PlanStale"}:
+            print("release plan became stale; repeating the same visible intent once", file=sys.stderr)
+            plan = plan_site_release(arguments)
+            deploy_arguments["plan_revision"] = str(
+                structured_content(plan).get("planRevision") or plan.get("_meta", {}).get("plan_revision") or ""
+            )
+            result = call_tool_result("DeploySiteVersion", deploy_arguments)
+        if result.get("isError"):
+            raise SystemExit(result_text(result))
+    return plan, result
+
+
+def create_release(args, site_id, version_id):
+    arguments = release_arguments(args, site_id, version_id)
+    plan = plan_site_release(arguments)
+    return deploy_planned_release(arguments, plan)
+
+
 def plan_site_version(site_id, source_type, source_manifest=None, build=None, runtime=None):
     if "PlanSiteVersion" not in available_tool_names():
         raise SystemExit(
@@ -1394,16 +1545,22 @@ def update_test_run(target, run, status, **resources):
     save_test_run(run, target)
 
 
-def complete_test_deployment(target, run, site_id, saved, version_timeout, deployment_timeout, interval):
+def complete_test_deployment(target, run, site_id, saved, version_timeout, deployment_timeout, interval, release_args):
     version_id = result_meta_id(saved, "version_id")
     update_test_run(target, run, "version-created", version=version_id)
     ready_version = wait_for_version(site_id, version_id, version_timeout, interval)
     update_test_run(target, run, "version-ready")
-    deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
+    release_plan, deployment = create_release(release_args, site_id, version_id)
     deployment_id = result_meta_id(deployment, "deployment_id")
     update_test_run(target, run, "deployment-created", deployment=deployment_id)
-    ready_deployment = wait_for_deployment(site_id, deployment_id, deployment_timeout, interval)
-    smoke = smoke_public_deployment(ready_deployment, site_id)
+    release_output = finish_release(
+        release_args, site_id, release_plan, deployment, deployment_timeout, interval, force_wait=True,
+    )
+    ready_deployment = release_output.get("release_status", deployment)
+    if release_output.get("paused"):
+        update_test_run(target, run, "paused", deployment=deployment_id)
+        return ready_version, ready_deployment, {"status": "paused", "plan": release_plan}
+    smoke = release_output.get("candidate_smoke") or release_output.get("public_smoke") or smoke_public_deployment(ready_deployment, site_id)
     update_test_run(target, run, "ready")
     return ready_version, ready_deployment, smoke
 
@@ -1623,6 +1780,113 @@ def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_second
             raise SystemExit(f"timed out waiting for SiteDeployment; last progress={json.dumps(snapshot, ensure_ascii=False)}")
 
 
+def release_status_snapshot(result):
+    status = structured_content(result)
+    return {
+        "state": status.get("state"), "phase": status.get("phase"), "terminal": status.get("terminal"),
+        "currentStep": status.get("currentStep"), "traffic": status.get("traffic"), "gate": status.get("gate"),
+        "blockedBy": status.get("blockedBy"), "nextActions": status.get("nextActions"),
+        "stable": status.get("stable"), "candidate": status.get("candidate"), "lanes": status.get("lanes"),
+    }
+
+
+def wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds=5.0, candidate_only=False):
+    require_tools("GetSiteReleaseStatus")
+    names = available_tool_names()
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    cursor = ""
+    while True:
+        result = call_tool("GetSiteReleaseStatus", {"site_id": site_id, "deployment_id": deployment_id})
+        snapshot = release_status_snapshot(result)
+        if snapshot != last:
+            print("Site release progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+            last = snapshot
+        candidate = snapshot.get("candidate")
+        traffic = snapshot.get("traffic") if isinstance(snapshot.get("traffic"), dict) else {}
+        if candidate_only and isinstance(candidate, dict) and candidate.get("revisionName") and candidate.get("upstream") and traffic.get("routingRevision"):
+            return result, False
+        phase = str(snapshot.get("phase") or "").lower()
+        state = str(snapshot.get("state") or "")
+        if phase == "ready":
+            return result, False
+        if phase in {"failed", "cancelled"}:
+            raise SystemExit("Site release failed:\n" + json.dumps(snapshot, ensure_ascii=False, indent=2))
+        if phase == "paused" or state in {"ManualApprovalRequired", "ManuallyPaused"}:
+            return result, True
+        if time.monotonic() >= deadline:
+            raise SystemExit("timed out waiting for Site release; last status=" + json.dumps(snapshot, ensure_ascii=False))
+        if "WatchSiteDeployment" in names:
+            remaining = max(1, int(deadline - time.monotonic()))
+            arguments = {
+                "site_id": site_id, "deployment_id": deployment_id,
+                "timeout_seconds": min(15, remaining),
+            }
+            if cursor:
+                arguments["cursor"] = cursor
+            watched = watch_or_get(
+                "WatchSiteDeployment", "GetSiteDeployment", arguments,
+                {"site_id": site_id, "deployment_id": deployment_id},
+            )
+            payload = structured_content(watched)
+            cursor = str(payload.get("cursor") or result_resource_version(watched) or cursor)
+        else:
+            time.sleep(interval_seconds)
+
+
+def latest_release_status(site_id, deployment_id):
+    return call_tool("GetSiteReleaseStatus", {"site_id": site_id, "deployment_id": deployment_id})
+
+
+def release_action_arguments(site_id, deployment_id, confirm=False):
+    status = structured_content(latest_release_status(site_id, deployment_id))
+    arguments = {
+        "site_id": site_id, "deployment_id": deployment_id,
+        "expected_step": int(status.get("currentStep") or 0),
+    }
+    phase = str(status.get("phase") or "")
+    if phase:
+        arguments["expected_phase"] = phase
+    traffic = status.get("traffic") if isinstance(status.get("traffic"), dict) else {}
+    if traffic.get("routingEpoch") is not None:
+        arguments["expected_routing_epoch"] = int(traffic["routingEpoch"])
+    if confirm:
+        arguments["confirm"] = True
+    return arguments
+
+
+def finish_release(args, site_id, plan, deployment, timeout_seconds, interval_seconds, force_wait=False):
+    deployment_id = result_meta_id(deployment, "deployment_id")
+    output = {"release_plan": plan, "deployment": deployment}
+    if getattr(args, "wait_candidate", False):
+        status, paused = wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds, candidate_only=True)
+        output["release_status"] = status
+        output["candidate_smoke"] = verify_candidate_lane(args, site_id, deployment_id)
+        output["paused"] = paused
+    elif getattr(args, "wait", False) or force_wait:
+        status, paused = wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds)
+        output["release_status"] = status
+        output["paused"] = paused
+        if not paused:
+            output["public_smoke"] = smoke_public_deployment(status, site_id)
+    return output
+
+
+def scaling_policy_from_args(args):
+    policy = {}
+    mapping = {
+        "min_scale": "min_scale", "max_scale": "max_scale", "target_concurrency": "target_concurrency",
+        "scale_down_delay_seconds": "scale_down_delay_seconds", "initial_scale": "initial_scale",
+    }
+    for source, target in mapping.items():
+        value = getattr(args, source, None)
+        if value is not None:
+            policy[target] = value
+    if args.profile == "custom" and not {"min_scale", "max_scale", "target_concurrency"}.issubset(policy):
+        raise SystemExit("custom scaling requires --min-scale, --max-scale, and --target-concurrency")
+    return policy
+
+
 def wait_for(tool, arguments, timeout_seconds, interval_seconds, success_phases, failure_phases):
     deadline = time.monotonic() + timeout_seconds
     last_phase = None
@@ -1665,7 +1929,7 @@ def smoke_public_deployment(result, site_id=""):
         # Shared APIG path routing publishes the canonical public URL on Site
         # status, while SiteDeployment deliberately exposes only its internal
         # smoke URL. Resolve the owning Site before declaring smoke N/A.
-        url = deployment_public_url(call_tool("GetSite", {"site_id": site_id}))
+        url = deployment_public_url(call_tool("GetSite", {"site_id": site_id, "relation": "accessible"}))
     if not url:
         return {"status": "not_applicable", "reason": "deployment exposes no public URL"}
     request = urllib.request.Request(url, headers={"User-Agent": "al-site/1"}, method="GET")
@@ -1680,6 +1944,59 @@ def smoke_public_deployment(result, site_id=""):
     if status < 200 or status >= 400:
         raise SystemExit(f"deployment reached Ready but public smoke check returned HTTP {status}: {url}")
     return {"status": "passed", "url": url, "http_status": status, "bytes_read": len(body)}
+
+
+def verify_candidate_lane(args, site_id, deployment_id):
+    strategy = release_strategy_from_args(args)
+    lanes = strategy.get("lanes") if isinstance(strategy.get("lanes"), list) else []
+    if not lanes:
+        raise SystemExit("--wait-candidate requires --signed-lane, --lane-header, or blue-green's automatic preview lane")
+    signed = next((lane for lane in lanes if lane.get("mode") == "signed-cookie"), None)
+    if signed:
+        session = call_tool("CreateSiteLaneSession", {
+            "site_id": site_id, "deployment_id": deployment_id, "lane": signed["name"],
+            "return_path": "/", "ttl_seconds": signed.get("ttl_seconds", 900),
+        })
+        activation = str(structured_content(session).get("activationURL") or "")
+        parsed = urllib.parse.urlparse(activation)
+        grant = urllib.parse.parse_qs(parsed.fragment).get("grant", [""])[0]
+        if not parsed.scheme.startswith("http") or not grant:
+            raise SystemExit("CreateSiteLaneSession returned an invalid activation URL")
+        bootstrap = urllib.parse.urlunparse(parsed._replace(fragment=""))
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        request = urllib.request.Request(
+            bootstrap, data=urllib.parse.urlencode({"grant": grant}).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "al-site/1"}, method="POST",
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                response.read(1 << 20)
+                target = response.headers.get("X-AL-Site-Target", "")
+                final_url = response.geturl()
+        except (urllib.error.HTTPError, urllib.error.URLError) as error:
+            raise SystemExit(f"candidate signed-lane smoke check failed: {error}")
+        if target != "candidate":
+            raise SystemExit(f"candidate lane was activated but Gateway reported target={target or 'unknown'}")
+        return {"status": "passed", "lane": signed["name"], "mode": "signed-cookie", "url": final_url, "target": target}
+    lane = lanes[0]
+    site = call_tool("GetSite", {"site_id": site_id, "relation": "accessible"})
+    url = deployment_public_url(site)
+    if not url:
+        raise SystemExit("Site has no public URL for header lane verification")
+    matcher = lane.get("header") if isinstance(lane.get("header"), dict) else {}
+    request = urllib.request.Request(
+        url, headers={str(matcher.get("name")): str(matcher.get("exact")), "User-Agent": "al-site/1"}, method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read(1 << 20)
+            target = response.headers.get("X-AL-Site-Target", "")
+    except (urllib.error.HTTPError, urllib.error.URLError) as error:
+        raise SystemExit(f"candidate header-lane smoke check failed: {error}")
+    if target != "candidate":
+        raise SystemExit(f"candidate header lane request reached target={target or 'unknown'}")
+    return {"status": "passed", "lane": lane["name"], "mode": "public-header", "url": url, "target": target}
 
 
 def run_git(path, *args, timeout=30):
@@ -1791,6 +2108,35 @@ def add_wait_options(parser, default_timeout):
     parser.add_argument("--interval-seconds", type=float, default=5.0)
 
 
+def add_release_options(parser, include_runtime=False):
+    strategy = parser.add_mutually_exclusive_group()
+    strategy.add_argument("--immediate", action="store_true", help="Promote to 100 percent after platform checks")
+    strategy.add_argument("--blue-green", action="store_true", help="Keep the candidate at 0 percent until promote")
+    strategy.add_argument("--canary", default="", metavar="PERCENTAGES", help="Strictly increasing percentages ending at 100, for example 5,25,100")
+    parser.add_argument("--step-duration", default="5m")
+    parser.add_argument("--step-timeout", default="30m")
+    parser.add_argument("--failure-action", choices=("rollback", "pause"), default="rollback")
+    parser.add_argument("--manual-approval", action="store_true")
+    parser.add_argument("--min-requests", type=int)
+    parser.add_argument("--max-error-rate", type=float)
+    parser.add_argument("--max-error-rate-increase", type=float)
+    parser.add_argument("--max-p95-ms", type=int)
+    parser.add_argument("--max-p95-ratio", type=float)
+    parser.add_argument("--compare-to-stable", action="store_true")
+    parser.add_argument("--max-activation-errors", type=int)
+    parser.add_argument("--missing-data", choices=("wait", "fail", "pass"), default="wait")
+    parser.add_argument("--sticky", dest="sticky", action="store_true", default=True)
+    parser.add_argument("--no-sticky", dest="sticky", action="store_false")
+    parser.add_argument("--sticky-ttl-seconds", type=int, default=86400)
+    parser.add_argument("--signed-lane", action="append", default=[], metavar="NAME")
+    parser.add_argument("--lane-header", action="append", default=[], metavar="HEADER=VALUE")
+    parser.add_argument("--lane-ttl-seconds", type=int, default=900)
+    parser.add_argument("--wait", action="store_true")
+    parser.add_argument("--wait-candidate", action="store_true")
+    if include_runtime:
+        parser.add_argument("--runtime", dest="release_runtime", default="{}", help="Runtime override JSON object or @file.json")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="AL Site MCP Gateway client")
     sub = parser.add_subparsers(dest="action", required=True)
@@ -1855,6 +2201,7 @@ def build_parser():
         local.add_argument("path", nargs="?", default=".")
         add_save_options(local)
         if name == "deploy-local":
+            add_release_options(local)
             add_wait_options(local, 1800)
             local.add_argument("--deployment-timeout-seconds", type=int, default=900)
 
@@ -1865,6 +2212,7 @@ def build_parser():
     test_local.add_argument("--confirm-public", action="store_true")
     test_local.add_argument("--build", default="{}")
     test_local.add_argument("--runtime", default="{}")
+    add_release_options(test_local)
     add_wait_options(test_local, 1800)
     test_local.add_argument("--deployment-timeout-seconds", type=int, default=900)
 
@@ -1875,6 +2223,7 @@ def build_parser():
     test_current.add_argument("--confirm-public", action="store_true")
     test_current.add_argument("--build", default="{}")
     test_current.add_argument("--runtime", default="{}")
+    add_release_options(test_current)
     add_wait_options(test_current, 1800)
     test_current.add_argument("--deployment-timeout-seconds", type=int, default=900)
 
@@ -1891,6 +2240,7 @@ def build_parser():
         local.add_argument("--credential-env", default="")
         add_save_options(local)
         if name == "deploy-local-git":
+            add_release_options(local)
             add_wait_options(local, 1800)
             local.add_argument("--deployment-timeout-seconds", type=int, default=900)
 
@@ -1899,16 +2249,26 @@ def build_parser():
     add_site_id(version)
     versions = sub.add_parser("versions")
     add_site_id(versions)
+    delete_version = sub.add_parser("delete-version")
+    delete_version.add_argument("version_id")
+    add_site_id(delete_version)
+    delete_version.add_argument("--confirm", action="store_true")
+    version_diff = sub.add_parser("version-diff")
+    version_diff.add_argument("version_a")
+    version_diff.add_argument("version_b")
+    add_site_id(version_diff)
     wait_version = sub.add_parser("wait-version")
     wait_version.add_argument("version_id")
     add_site_id(wait_version)
     add_wait_options(wait_version, 1800)
 
-    deploy = sub.add_parser("deploy")
-    deploy.add_argument("version_id")
-    add_site_id(deploy)
-    deploy.add_argument("--runtime", default="{}")
-    deploy.add_argument("--strategy", default="{}")
+    for name in ("release-plan", "release", "deploy"):
+        release = sub.add_parser(name)
+        release.add_argument("version_id")
+        add_site_id(release)
+        add_release_options(release, include_runtime=True)
+        if name != "release-plan":
+            add_wait_options(release, 900)
     deployment = sub.add_parser("deployment")
     deployment.add_argument("deployment_id")
     add_site_id(deployment)
@@ -1918,6 +2278,53 @@ def build_parser():
     wait_deployment.add_argument("deployment_id")
     add_site_id(wait_deployment)
     add_wait_options(wait_deployment, 900)
+
+    release_status = sub.add_parser("release-status")
+    release_status.add_argument("deployment_id")
+    add_site_id(release_status)
+    release_status.add_argument("--watch", action="store_true")
+    add_wait_options(release_status, 900)
+
+    open_lane = sub.add_parser("open-lane")
+    open_lane.add_argument("deployment_id")
+    open_lane.add_argument("lane")
+    add_site_id(open_lane)
+    open_lane.add_argument("--return-path", default="/")
+    open_lane.add_argument("--ttl-seconds", type=int, default=900)
+    open_lane.add_argument("--open-browser", action="store_true")
+
+    revoke_lane = sub.add_parser("revoke-lane")
+    revoke_lane.add_argument("deployment_id")
+    revoke_lane.add_argument("lane")
+    add_site_id(revoke_lane)
+    revoke_lane.add_argument("--confirm", action="store_true")
+
+    for name in ("promote", "pause", "resume", "cancel", "rollback"):
+        action = sub.add_parser(name)
+        action.add_argument("deployment_id")
+        add_site_id(action)
+        if name in {"promote", "cancel", "rollback"}:
+            action.add_argument("--confirm", action="store_true")
+        if name == "resume":
+            action.add_argument("--extend-timeout", default="", metavar="DURATION", help="Explicitly extend an elapsed canary step timeout, for example 10m")
+        if name == "rollback":
+            action.add_argument("--wait", action="store_true")
+            add_wait_options(action, 900)
+
+    scaling_status = sub.add_parser("scaling-status")
+    add_site_id(scaling_status)
+    for name in ("scaling-set-defaults", "scaling-apply"):
+        scaling = sub.add_parser(name)
+        add_site_id(scaling)
+        scaling.add_argument("--profile", required=True, choices=("economy", "balanced", "latency", "burst", "custom"))
+        scaling.add_argument("--min-scale", type=int)
+        scaling.add_argument("--max-scale", type=int)
+        scaling.add_argument("--target-concurrency", type=int)
+        scaling.add_argument("--scale-down-delay-seconds", type=int)
+        scaling.add_argument("--initial-scale", type=int)
+        if name == "scaling-apply":
+            scaling.add_argument("--wait", action="store_true")
+            add_wait_options(scaling, 900)
 
     register_generic_tool_commands(sub)
     return parser
@@ -2022,7 +2429,7 @@ def main():
                 }
             ready_version, ready_deployment, smoke = complete_test_deployment(
                 target, run, site_id, saved, args.timeout_seconds,
-                args.deployment_timeout_seconds, args.interval_seconds,
+                args.deployment_timeout_seconds, args.interval_seconds, args,
             )
         except BaseException as error:
             run["failure_type"] = type(error).__name__
@@ -2129,11 +2536,13 @@ def main():
         site_id = selected_site_id(args.site_id)
         version_id = result_meta_id(saved, "version_id")
         ready_version = wait_for_version(site_id, version_id, args.timeout_seconds, args.interval_seconds)
-        deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
-        deployment_id = result_meta_id(deployment, "deployment_id")
-        ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
-        smoke = smoke_public_deployment(ready_deployment, site_id)
-        print_json({"local_source": local, "plan": plan, "version": ready_version, "deployment": ready_deployment, "public_smoke": smoke})
+        release_plan, deployment = create_release(args, site_id, version_id)
+        released = finish_release(
+            args, site_id, release_plan, deployment, args.deployment_timeout_seconds, args.interval_seconds, force_wait=True,
+        )
+        print_json({"local_source": local, "plan": plan, "version": ready_version, **released})
+        if released.get("paused"):
+            raise SystemExit(3)
         return
     if args.action in {"save-local-git", "deploy-local-git"}:
         local = inspect_local_git(args.path, args.remote, args.branch, args.skip_remote_check)
@@ -2152,13 +2561,16 @@ def main():
         site_id = arguments["site_id"]
         version_id = result_meta_id(saved, "version_id")
         ready_version = wait_for_version(site_id, version_id, args.timeout_seconds, args.interval_seconds)
-        deployment = call_tool("DeploySiteVersion", {"site_id": site_id, "version_id": version_id})
-        deployment_id = result_meta_id(deployment, "deployment_id")
-        ready_deployment = wait_for_deployment(site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds)
+        release_plan, deployment = create_release(args, site_id, version_id)
+        released = finish_release(
+            args, site_id, release_plan, deployment, args.deployment_timeout_seconds, args.interval_seconds, force_wait=True,
+        )
         print_json({
             "local_git": local, "plan": plan, "version": ready_version,
-            "deployment": ready_deployment, "public_smoke": smoke_public_deployment(ready_deployment, site_id),
+            **released,
         })
+        if released.get("paused"):
+            raise SystemExit(3)
         return
     if args.action == "version":
         print_json(call_tool("GetSiteVersion", {"site_id": selected_site_id(args.site_id), "version_id": args.version_id}))
@@ -2166,17 +2578,39 @@ def main():
     if args.action == "versions":
         print_json(call_tool("ListSiteVersions", {"site_id": selected_site_id(args.site_id)}))
         return
+    if args.action == "delete-version":
+        if not args.confirm:
+            raise SystemExit("delete-version requires --confirm because immutable version history is permanently removed")
+        site_id = selected_site_id(args.site_id)
+        current = call_tool("GetSiteVersion", {"site_id": site_id, "version_id": args.version_id})
+        uid, resource_version = result_uid(current), result_resource_version(current)
+        if not uid or not resource_version:
+            raise SystemExit("refusing version deletion: GetSiteVersion did not return current UID and resourceVersion")
+        print_json(call_tool("DeleteSiteVersion", {
+            "site_id": site_id, "version_id": args.version_id, "expected_uid": uid,
+            "resource_version": resource_version, "confirm": True,
+        }))
+        return
+    if args.action == "version-diff":
+        print_json(call_tool("CompareSiteVersions", {
+            "site_id": selected_site_id(args.site_id), "version_a": args.version_a, "version_b": args.version_b,
+        }))
+        return
     if args.action == "wait-version":
         print_json(wait_for_version(selected_site_id(args.site_id), args.version_id, args.timeout_seconds, args.interval_seconds))
         return
-    if args.action == "deploy":
-        arguments = {"site_id": selected_site_id(args.site_id), "version_id": args.version_id}
-        runtime, strategy = load_json_object(args.runtime), load_json_object(args.strategy)
-        if runtime:
-            arguments["runtime"] = runtime
-        if strategy:
-            arguments["strategy"] = strategy
-        print_json(call_tool("DeploySiteVersion", arguments))
+    if args.action in {"release-plan", "release", "deploy"}:
+        site_id = selected_site_id(args.site_id)
+        arguments = release_arguments(args, site_id, args.version_id)
+        plan = plan_site_release(arguments)
+        if args.action == "release-plan":
+            print_json(plan)
+            return
+        plan, deployment = deploy_planned_release(arguments, plan)
+        output = finish_release(args, site_id, plan, deployment, args.timeout_seconds, args.interval_seconds)
+        print_json(output)
+        if output.get("paused"):
+            raise SystemExit(3)
         return
     if args.action == "deployment":
         print_json(call_tool("GetSiteDeployment", {"site_id": selected_site_id(args.site_id), "deployment_id": args.deployment_id}))
@@ -2188,6 +2622,102 @@ def main():
         print_json(wait_for_deployment(
             selected_site_id(args.site_id), args.deployment_id, args.timeout_seconds, args.interval_seconds,
         ))
+        return
+    if args.action == "release-status":
+        site_id = selected_site_id(args.site_id)
+        if args.watch:
+            status, paused = wait_for_release(site_id, args.deployment_id, args.timeout_seconds, args.interval_seconds)
+            print_json(status)
+            if paused:
+                raise SystemExit(3)
+        else:
+            print_json(latest_release_status(site_id, args.deployment_id))
+        return
+    if args.action == "open-lane":
+        site_id = selected_site_id(args.site_id)
+        result = call_tool("CreateSiteLaneSession", {
+            "site_id": site_id, "deployment_id": args.deployment_id, "lane": args.lane,
+            "return_path": args.return_path, "ttl_seconds": args.ttl_seconds,
+        })
+        activation = str(structured_content(result).get("activationURL") or "")
+        if args.open_browser and activation:
+            webbrowser.open(activation)
+        print_json(result)
+        return
+    if args.action == "revoke-lane":
+        if not args.confirm:
+            raise SystemExit("revoke-lane requires --confirm because it invalidates all current sessions for the lane epoch")
+        site_id = selected_site_id(args.site_id)
+        status = structured_content(latest_release_status(site_id, args.deployment_id))
+        traffic = status.get("traffic") if isinstance(status.get("traffic"), dict) else {}
+        arguments = {
+            "site_id": site_id, "deployment_id": args.deployment_id, "lane": args.lane, "confirm": True,
+            "expected_routing_epoch": int(traffic.get("routingEpoch") or 0),
+        }
+        print_json(call_tool("RevokeSiteLaneSessions", arguments))
+        return
+    if args.action in {"promote", "pause", "resume", "cancel"}:
+        if args.action in {"promote", "cancel"} and not args.confirm:
+            raise SystemExit(f"{args.action} requires --confirm")
+        site_id = selected_site_id(args.site_id)
+        tool = {
+            "promote": "PromoteSiteDeployment", "pause": "PauseSiteDeployment",
+            "resume": "ResumeSiteDeployment", "cancel": "CancelSiteDeployment",
+        }[args.action]
+        arguments = release_action_arguments(site_id, args.deployment_id, confirm=args.action in {"promote", "cancel"})
+        if args.action == "resume" and args.extend_timeout:
+            arguments["extend_timeout"] = args.extend_timeout
+        print_json(call_tool(tool, arguments))
+        return
+    if args.action == "rollback":
+        if not args.confirm:
+            raise SystemExit("rollback requires --confirm; application traffic changes but database state is never rolled back")
+        site_id = selected_site_id(args.site_id)
+        deployment = call_tool("RollbackSite", {"site_id": site_id, "deployment_id": args.deployment_id, "confirm": True})
+        if args.wait:
+            rollback_id = result_meta_id(deployment, "deployment_id")
+            status, paused = wait_for_release(site_id, rollback_id, args.timeout_seconds, args.interval_seconds)
+            print_json({"deployment": deployment, "release_status": status, "paused": paused})
+            if paused:
+                raise SystemExit(3)
+        else:
+            print_json(deployment)
+        return
+    if args.action == "scaling-status":
+        print_json(call_tool("GetSiteScaling", {"site_id": selected_site_id(args.site_id)}))
+        return
+    if args.action in {"scaling-set-defaults", "scaling-apply"}:
+        site_id = selected_site_id(args.site_id)
+        policy = scaling_policy_from_args(args)
+        if args.action == "scaling-set-defaults":
+            current = call_tool("GetSite", {"site_id": site_id, "relation": "accessible"})
+            arguments = {
+                "site_id": site_id, "resource_version": result_resource_version(current),
+                "scaling_profile": args.profile,
+            }
+            if policy:
+                arguments["scaling"] = policy
+            print_json(call_tool("UpdateSite", arguments))
+            return
+        plan_arguments = {"site_id": site_id, "scaling_profile": args.profile}
+        if policy:
+            plan_arguments["scaling"] = policy
+        plan = call_tool("PlanSiteScaling", plan_arguments)
+        payload = structured_content(plan)
+        if not payload.get("valid"):
+            raise SystemExit("Site scaling preflight failed:\n" + json.dumps(payload.get("errors") or [], ensure_ascii=False, indent=2))
+        plan_revision = str(payload.get("planRevision") or plan.get("_meta", {}).get("plan_revision") or "")
+        apply_arguments = dict(plan_arguments, plan_revision=plan_revision, confirm=True)
+        deployment = call_tool("UpdateSiteScaling", apply_arguments)
+        if args.wait:
+            deployment_id = result_meta_id(deployment, "deployment_id")
+            status, paused = wait_for_release(site_id, deployment_id, args.timeout_seconds, args.interval_seconds)
+            print_json({"plan": plan, "deployment": deployment, "release_status": status, "paused": paused})
+            if paused:
+                raise SystemExit(3)
+        else:
+            print_json({"plan": plan, "deployment": deployment})
+        return
 
 
 if __name__ == "__main__":

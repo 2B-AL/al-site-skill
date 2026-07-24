@@ -1,4 +1,4 @@
 interface:
   display_name: "AL Site"
-  short_description: "Deploy local code and operate AL Sites through Site MCP"
-  default_prompt: "Use $al-site to deploy local code or operate an AL Site through the public Site MCP Gateway."
+  short_description: "Release and operate persistent AL Sites through Site MCP"
+  default_prompt: "Use $al-site to save an immutable version, plan a safe release, deploy it, and report the live rollout and scaling status."

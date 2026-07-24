@@ -5,9 +5,10 @@
 | 领域 | 工具 |
 | --- | --- |
 | Site | `CreateSite`, `SelectSite`, `GetCurrentSite`, `GetSite`, `ListSites`, `UpdateSite`, `DeleteSite` |
-| Capability/Plan | `GetSitePlatformCapabilities`, `PlanSiteVersion` |
-| Version | `SaveSiteVersion`, `GetSiteVersion`, `WatchSiteVersion`, `GetSiteVersionLogs`, `CancelSiteVersion`, `ListSiteVersions`, `DeleteSiteVersion` |
-| Deployment | `DeploySiteVersion`, `GetSiteDeployment`, `WatchSiteDeployment`, `ListSiteDeployments`, `PromoteSiteDeployment`, `RollbackSite`, `CancelSiteDeployment`, `PauseSiteDeployment` |
+| Capability/Plan | `GetSitePlatformCapabilities`, `PlanSiteVersion`, `PlanSiteDeployment`, `PlanSiteScaling` |
+| Version | `SaveSiteVersion`, `GetSiteVersion`, `WatchSiteVersion`, `GetSiteVersionLogs`, `CancelSiteVersion`, `ListSiteVersions`, `CompareSiteVersions`, `DeleteSiteVersion` |
+| Release | `DeploySiteVersion`, `GetSiteDeployment`, `GetSiteReleaseStatus`, `WatchSiteDeployment`, `ListSiteDeployments`, `CreateSiteLaneSession`, `RevokeSiteLaneSessions`, `PromoteSiteDeployment`, `PauseSiteDeployment`, `ResumeSiteDeployment`, `CancelSiteDeployment`, `RollbackSite` |
+| Scaling | `GetSiteScaling`, `PlanSiteScaling`, `UpdateSiteScaling` |
 | Access/Governance | `GetSiteAccessPolicy`, `SetSiteAccessPolicy`, `SetSiteGovernance`, `SubmitSiteAppeal` |
 | Domain | `SetSiteDomain`, `ListSiteDomains`, `VerifySiteDomain`, `DeleteSiteDomain` |
 | Observability | `GetSiteLogs`, `GetSiteEvents`, `GetSiteMetrics`, `GetSiteUsage` |
@@ -47,8 +48,12 @@ python3 scripts/al_mcp.py set-site-access-policy \
 | `cleanup-test-run RUN_FILE --confirm` | UID 复核后仅删除该清单创建的测试 Site 及其受控子资源 |
 | `save-git` / `save-local-git` | `SaveSiteVersion(git)` |
 | `save-oci` | `SaveSiteVersion(oci)` |
-| `version` / `versions` / `wait-version` | `GetSiteVersion` / `WatchSiteVersion`; failure diagnostics use `GetSiteVersionLogs` including Preview runtime details |
-| `deploy` | `DeploySiteVersion` |
+| `version` / `versions` / `version-diff` / `wait-version` / `delete-version` | immutable Version query, comparison, watch, and preconditioned deletion |
+| `release-plan` / `release` / `deploy` | `PlanSiteDeployment` then `DeploySiteVersion(plan_revision)` |
+| `release-status` | structured `GetSiteReleaseStatus`; `--watch` exits 3 on actionable pause |
+| `open-lane` / `revoke-lane` | signed candidate session and epoch revocation |
+| `promote` / `pause` / `resume` / `cancel` / `rollback` | current-state protected release actions; rollback plans first |
+| `scaling-status` / `scaling-set-defaults` / `scaling-apply` | query, future defaults, or planned current-production change |
 | `deployment` / `deployments` / `wait-deployment` | `GetSiteDeployment` / `WatchSiteDeployment`; cursor 长轮询持续显示 smoke、traffic 和 gate 状态 |
 | `archive` | Gateway conversation archive endpoint |
 
@@ -62,4 +67,4 @@ public/selected audience、公网 URL 或应用侧访问认证属于数据面，
 更新必须携带最新 `resource_version`；删除必须携带 `confirm=true`、最新 `expected_uid` 和
 `resource_version`，发生冲突时重新 Get 后再决定是否重试。
 
-`GetSitePlatformCapabilities` 决定当前路由模式允许的 audience、public publishing 和 identity forwarding 组合。客户端必须在创建资源前拒绝不支持的组合，尤其不能把显式 `owner` 静默改成 `public`。`PlanSiteVersion` 是所有源码后端共用的强制 preflight；没有 plan 能力时，强类型发布命令 fail closed。
+`GetSitePlatformCapabilities` 决定当前路由模式允许的 audience、release strategy、lane、metric gate、scaling profile 和 readiness。客户端必须在创建资源前拒绝不支持的组合，尤其不能把显式 `owner` 静默改成 `public`。`PlanSiteVersion` 是源码 preflight，`PlanSiteDeployment` 是所有生产流量变化的强制 preflight；没有 plan 能力时，强类型发布命令 fail closed。

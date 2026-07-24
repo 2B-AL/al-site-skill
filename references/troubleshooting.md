@@ -1,5 +1,30 @@
 # 排障
 
+## 结构化发布错误
+
+发布排障优先运行：
+
+```bash
+python3 scripts/al_mcp.py release-status DEPLOYMENT_ID --watch
+```
+
+只根据 `state`、`blockedBy[].code`、`gate` 和 `nextActions` 决策，不解析自由文本 Condition。常见处理：
+
+- `DeploymentPlanStale`：客户端只会对完全相同的可见意图重新 Plan 一次；再次失败则重新检查 active rollout。
+- `ManualApprovalRequired`：先用 signed/header lane 验证 candidate，再 `promote --confirm` 或 rollback。
+- `MetricSamplesInsufficient`：显示当前样本，继续等或产生预期流量；不要强制当作 pass。
+- `ObservabilityUnavailable`：stable 保持不变，检查 VMP workspace、prometheus-agent、ServiceMonitor 和 Adapter readiness。
+- `RollbackBlockedByMigration`：数据库不会回滚；要求应用/迁移兼容性 review，使用 `failureAction=pause`。
+- `ScalingQuotaExceeded`：按 capability 的 quota/headroom 降低 candidate maxScale。
+
+## Candidate lane 没有命中
+
+`--wait-candidate` 要求公网响应 `X-AL-Site-Target: candidate`。如果失败，检查 Deployment 的 candidate、routing epoch 和 lanes 是否已出现在 `release-status`；不要直接请求 Knative 私有 URL。Header Lane 还要确认 Key 在 capability allowlist 且 Value 精确匹配。Signed Lane grant 只能消费一次，过期后重新 `open-lane`。
+
+## Metrics configured 但 unavailable
+
+`configured=true, available=false` 不是零流量。依次检查 Provider 的 VMP query output、Adapter VMP Secret、Adapter `/readyz`、prometheus-agent addon、ServiceMonitor label 和实际 series freshness。Skill/MCP 不允许提交任意 PromQL。
+
 ## 切换 Site MCP Gateway
 
 当前 dev 已内置独立 Site MCP Gateway。只有使用其他环境或显式清空/覆盖配置时，才需要配置 Gateway：
