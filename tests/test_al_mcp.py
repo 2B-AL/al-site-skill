@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -17,6 +18,29 @@ SPEC.loader.exec_module(al_site)
 
 
 class SiteClientTest(unittest.TestCase):
+
+    def test_state_updates_are_atomic_under_concurrency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = pathlib.Path(directory)
+            with mock.patch.object(al_site, "STATE_DIR", state_dir), mock.patch.object(
+                al_site, "STATE_FILE", state_dir / "state.json"
+            ), mock.patch.object(al_site, "STATE_LOCK_FILE", state_dir / "state.lock"):
+                failures = []
+
+                def write(index):
+                    try:
+                        al_site.update_state(lambda state: state.__setitem__(f"key-{index}", index))
+                    except Exception as error:  # pragma: no cover - assertion reports the exact race
+                        failures.append(error)
+
+                threads = [threading.Thread(target=write, args=(index,)) for index in range(24)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                self.assertEqual([], failures)
+                self.assertEqual(24, len(al_site.load_state()))
+
     def test_repository_uses_mcp_client_with_ui_metadata(self):
         root = pathlib.Path(__file__).parents[1]
         self.assertTrue((root / "scripts" / "al_mcp.py").is_file())
@@ -442,6 +466,9 @@ class SiteClientTest(unittest.TestCase):
             self.assertEqual(0.01, strategy["steps"][0]["metric_gate"]["max_error_rate"])
             self.assertEqual("X-AL-Site-Lane", strategy["lanes"][0]["header"]["name"])
 
+        compare = parser.parse_args(["release", "version-1", "--canary", "100", "--compare-to-stable"])
+        self.assertTrue(al_site.release_strategy_from_args(compare)["steps"][0]["metric_gate"]["compare_to_stable"])
+
     def test_blue_green_wait_candidate_adds_protected_preview_lane(self):
         args = al_site.build_parser().parse_args(["release", "version-1", "--blue-green", "--wait-candidate"])
         strategy = al_site.release_strategy_from_args(args)
@@ -532,6 +559,27 @@ class SiteClientTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "custom scaling requires"):
             al_site.scaling_policy_from_args(args)
 
+    def test_scaling_apply_requires_confirmation_and_forwards_plan_revision(self):
+        with mock.patch("sys.argv", ["al_mcp.py", "scaling-apply", "--site-id", "site-1", "--profile", "latency"]):
+            with self.assertRaisesRegex(SystemExit, "requires --confirm"):
+                al_site.main()
+
+        plan = {"structuredContent": {"valid": True, "planRevision": "signed-scaling-plan"}}
+        deployed = {"_meta": {"deployment_id": "deployment-2"}}
+        with mock.patch("sys.argv", [
+            "al_mcp.py", "scaling-apply", "--site-id", "site-1", "--profile", "latency", "--confirm",
+        ]), mock.patch.object(al_site, "call_tool", side_effect=[plan, deployed]) as call, mock.patch.object(
+            al_site, "print_json"
+        ):
+            al_site.main()
+        self.assertEqual(mock.call("PlanSiteScaling", {
+            "site_id": "site-1", "scaling_profile": "latency",
+        }), call.call_args_list[0])
+        self.assertEqual(mock.call("UpdateSiteScaling", {
+            "site_id": "site-1", "scaling_profile": "latency",
+            "plan_revision": "signed-scaling-plan", "confirm": True,
+        }), call.call_args_list[1])
+
     def test_wait_deployment_uses_cursor_until_traffic_ready(self):
         responses = [
             {"structuredContent": {"cursor": "20", "deployment": {"status": {"phase": "CreatingRevision", "trafficPercent": 0}}}},
@@ -543,6 +591,28 @@ class SiteClientTest(unittest.TestCase):
             result = al_site.wait_for_deployment("site-1", "deployment-1", 30)
         self.assertEqual("Ready", al_site.phase_of(result))
         self.assertEqual("20", call.call_args_list[1].args[1]["cursor"])
+
+    def test_wait_deployment_throttles_unchanged_watch_responses(self):
+        unchanged = {"structuredContent": {"cursor": "20", "deployment": {"status": {"phase": "CreatingRevision", "trafficPercent": 0}}}}
+        ready = {"structuredContent": {"cursor": "21", "deployment": {"status": {"phase": "Ready", "trafficPercent": 100}}}}
+        with mock.patch.object(al_site, "available_tool_names", return_value={"WatchSiteDeployment"}), mock.patch.object(
+            al_site, "call_tool", side_effect=[unchanged, unchanged, ready]
+        ), mock.patch.object(al_site.time, "sleep") as sleep:
+            result = al_site.wait_for_deployment("site-1", "deployment-1", 30, interval_seconds=2)
+        self.assertEqual("Ready", al_site.phase_of(result))
+        sleep.assert_called_once_with(2)
+
+    def test_version_summary_omits_controller_bookkeeping(self):
+        summary = al_site.version_summary({"structuredContent": {
+            "metadata": {"name": "version-1", "uid": "uid-1", "resourceVersion": "42", "managedFields": ["noise"]},
+            "spec": {"buildPlanRevision": "static-v1", "build": {"mode": "Static"}},
+            "status": {"phase": "Ready", "imageDigest": "registry/site@sha256:abc", "source": {"jobRef": "job-1"}, "conditions": ["noise"]},
+        }})
+        self.assertEqual("version-1", summary["id"])
+        self.assertEqual("registry/site@sha256:abc", summary["imageDigest"])
+        self.assertNotIn("metadata", summary)
+        self.assertNotIn("conditions", summary)
+        self.assertNotIn("source", summary.get("status", {}))
 
     def test_active_version_log_progress_is_cursor_deduplicated(self):
         response = {"structuredContent": {"cursor": "2026-07-22T12:00:00Z", "content": "vertex 1\nvertex 2"}}

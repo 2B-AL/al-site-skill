@@ -108,12 +108,12 @@ python3 scripts/al_mcp.py delete-version VERSION_ID --confirm
 
 python3 scripts/al_mcp.py scaling-status
 python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
-python3 scripts/al_mcp.py scaling-apply --profile latency --wait
+python3 scripts/al_mcp.py scaling-apply --profile latency --confirm --wait
 python3 scripts/al_mcp.py scaling-apply --profile custom \
-  --min-scale 1 --max-scale 20 --target-concurrency 20 --wait
+  --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
 ```
 
-Resume never resets the observation window. If structured status reports `PausedStepTimeoutElapsed`, require the user to choose `resume --extend-timeout DURATION` or rollback. `delete-version` first reads the latest Version UID and resourceVersion, then forwards both with explicit confirmation; the platform refuses active or otherwise referenced Versions. `scaling-set-defaults` changes future defaults only. `scaling-apply` plans and creates a new immutable Deployment for the active Version. Never describe a defaults update as changing current production. Read [references/scaling.md](references/scaling.md) and [references/versions.md](references/versions.md).
+Resume never resets the observation window. If structured status reports `PausedStepTimeoutElapsed`, require the user to choose `resume --extend-timeout DURATION` or rollback. `delete-version` first reads the latest Version UID and resourceVersion, then forwards both with explicit confirmation; the platform refuses active or otherwise referenced Versions. `scaling-set-defaults` changes future defaults only. `scaling-apply --confirm` plans and creates a new immutable Deployment for the active Version. Never describe a defaults update as changing current production. Read [references/scaling.md](references/scaling.md) and [references/versions.md](references/versions.md).
 
 ## Preserve safety boundaries
 

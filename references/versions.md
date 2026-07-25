@@ -33,6 +33,13 @@ python3 scripts/al_mcp.py deployment DEPLOYMENT_ID
 
 Version comparison is read-only and bounded. Deployment history is the source for image/config/binding/runtime/scaling snapshots and rollback targets.
 
+The strong `version`, `versions`, and `version-diff` commands show immutable
+source/build/runtime contracts and material artifact differences. Controller
+bookkeeping such as managedFields, Job names, condition timestamps, and preview
+object references is deliberately omitted so it cannot masquerade as a version
+change. Use a generic MCP tool command only when raw debugging data is explicitly
+required.
+
 ## Deletion protection
 
 `delete-version` fetches the latest UID and resourceVersion itself and sends both as atomic preconditions. The manager remains authoritative for the `VersionInUse` check; the Skill never guesses from a stale list result. Site deletion is separate and permanent. `archive` only clears conversation selection.

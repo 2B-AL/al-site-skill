@@ -71,9 +71,9 @@ python3 scripts/al_mcp.py rollback HISTORICAL_DEPLOYMENT_ID --confirm --wait
 ```bash
 python3 scripts/al_mcp.py scaling-status
 python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
-python3 scripts/al_mcp.py scaling-apply --profile latency --wait
+python3 scripts/al_mcp.py scaling-apply --profile latency --confirm --wait
 python3 scripts/al_mcp.py scaling-apply --profile custom \
-  --min-scale 1 --max-scale 20 --target-concurrency 20 --wait
+  --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
 ```
 
 `scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。

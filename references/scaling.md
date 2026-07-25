@@ -15,7 +15,7 @@
 
 ```bash
 python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
-python3 scripts/al_mcp.py scaling-apply --profile latency --wait
+python3 scripts/al_mcp.py scaling-apply --profile latency --confirm --wait
 ```
 
 ## Profiles and custom policies
@@ -26,7 +26,7 @@ Custom requires all three:
 
 ```bash
 python3 scripts/al_mcp.py scaling-apply --profile custom \
-  --min-scale 1 --max-scale 20 --target-concurrency 20 --wait
+  --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
 ```
 
 Optional custom fields are `--initial-scale` and `--scale-down-delay-seconds`. `min-scale=0` enables scale-to-zero when the environment reports support.
@@ -42,4 +42,3 @@ The response distinguishes `configured` from `available`. When available it incl
 ## Release interaction
 
 Candidate scaling is fixed in that Deployment's runtime snapshot. Plan must account for stable and candidate worst-case coexistence. A rollback restores the historical Deployment scaling snapshot. A 0% Blue-Green candidate may scale from zero when a signed lane request arrives.
-

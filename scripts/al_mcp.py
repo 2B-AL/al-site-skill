@@ -3,6 +3,7 @@ import argparse
 import concurrent.futures
 import datetime
 import fnmatch
+import fcntl
 import gzip
 import hashlib
 import http.server
@@ -30,6 +31,7 @@ DEFAULT_LOGIN_CALLBACK_URL = "http://127.0.0.1:8766/oauth/callback"
 DEFAULT_GATEWAY_URL = "https://skr0bjcv434ri5v3bqdlq.apigateway-cn-beijing.volceapi.com"
 STATE_DIR = pathlib.Path(os.environ.get("AL_SITE_STATE_DIR", "~/.al-site-mcp")).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
+STATE_LOCK_FILE = STATE_DIR / "state.lock"
 TEST_RUNS_DIR = STATE_DIR / "test-runs"
 
 SITE_TOOLS = (
@@ -67,14 +69,44 @@ def load_state():
     return data if isinstance(data, dict) else {}
 
 
+def _write_state_atomic(state):
+    descriptor, temporary = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=STATE_DIR)
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE_FILE)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def save_state(state):
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STATE_FILE)
+    with STATE_LOCK_FILE.open("a+", encoding="utf-8") as lock:
+        os.chmod(STATE_LOCK_FILE, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _write_state_atomic(state)
+
+
+def update_state(mutator):
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with STATE_LOCK_FILE.open("a+", encoding="utf-8") as lock:
+        os.chmod(STATE_LOCK_FILE, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load_state()
+        result = mutator(state)
+        _write_state_atomic(state)
+        return result
 
 
 def save_test_run(record, destination=""):
@@ -85,12 +117,24 @@ def save_test_run(record, destination=""):
         raise SystemExit("Site test run manifest has an invalid run_id")
     target = pathlib.Path(destination).expanduser() if destination else TEST_RUNS_DIR / (run_id + ".json")
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, target)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + target.name + "-", suffix=".tmp", dir=target.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            json.dump(record, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
     return target
 
 
@@ -186,10 +230,8 @@ def login_callback_url():
 
 
 def configure_gateway(value):
-    state = load_state()
-    state["gateway_url"] = validate_gateway_url(value)
-    save_state(state)
-    return state["gateway_url"]
+    gateway_url = validate_gateway_url(value)
+    return update_state(lambda state: state.__setitem__("gateway_url", gateway_url) or gateway_url)
 
 
 def cached_token():
@@ -212,22 +254,22 @@ def ensure_conversation_id():
     value = os.environ.get("AL_SITE_CONVERSATION_ID", "").strip()
     if value:
         return value
-    state = load_state()
-    value = str(state.get("conversation_id") or "").strip()
-    if value:
-        return value
-    value = str(uuid.uuid4())
-    state["conversation_id"] = value
-    save_state(state)
-    return value
+    def ensure(state):
+        current = str(state.get("conversation_id") or "").strip()
+        if current:
+            return current
+        current = str(uuid.uuid4())
+        state["conversation_id"] = current
+        return current
+    return update_state(ensure)
 
 
 def set_new_conversation_id():
-    state = load_state()
-    state["conversation_id"] = str(uuid.uuid4())
-    state.pop("site_id", None)
-    save_state(state)
-    return state["conversation_id"]
+    def reset(state):
+        state["conversation_id"] = str(uuid.uuid4())
+        state.pop("site_id", None)
+        return state["conversation_id"]
+    return update_state(reset)
 
 
 def cache_resource_ids(result):
@@ -236,15 +278,13 @@ def cache_resource_ids(result):
     meta = result.get("_meta")
     if not isinstance(meta, dict):
         return
-    state = load_state()
-    changed = False
+    values = {}
     for key in ("site_id", "version_id", "deployment_id"):
         value = str(meta.get(key) or "").strip()
         if value:
-            state[key] = value
-            changed = True
-    if changed:
-        save_state(state)
+            values[key] = value
+    if values:
+        update_state(lambda state: state.update(values))
 
 
 class LoginCallbackHandler(http.server.BaseHTTPRequestHandler):
@@ -304,19 +344,17 @@ def login():
         expires_in = int(LoginCallbackHandler.result.get("expires_in") or 3600)
     except (TypeError, ValueError):
         expires_in = 3600
-    state = load_state()
-    state["access_token"] = token
-    state["expires_at"] = int(time.time() + max(expires_in - 60, 60))
-    save_state(state)
+    expires_at = int(time.time() + max(expires_in - 60, 60))
+    update_state(lambda state: state.update({"access_token": token, "expires_at": expires_at}))
     print("login ok", file=sys.stderr)
     return token
 
 
 def logout():
-    state = load_state()
-    state.pop("access_token", None)
-    state.pop("expires_at", None)
-    save_state(state)
+    def clear_auth(state):
+        state.pop("access_token", None)
+        state.pop("expires_at", None)
+    update_state(clear_auth)
 
 
 def headers():
@@ -824,10 +862,11 @@ def source_manifest_from_entries(entries):
             executable_modes[relative] = mode
     if len(manifest_entries) > 4096:
         raise SystemExit("source manifest exceeds the 4096-entry planning limit; narrow build.context/source root")
-    return {
+    summary = {
         "root": ".", "files": manifest_entries, "executable_modes": executable_modes,
         "digest": "sha256:" + manifest_hash.hexdigest(), "path_prefix_aware": path_prefix_aware,
     }
+    return summary
 
 
 def create_source_manifest(path):
@@ -864,9 +903,7 @@ def save_local_source(path, site_id, build_json="{}", runtime_json="{}"):
 
 def archive_conversation_site():
     result = post_gateway_json("/internal/conversation-site/archive", {})
-    state = load_state()
-    state.pop("site_id", None)
-    save_state(state)
+    update_state(lambda state: state.pop("site_id", None))
     return result
 
 
@@ -937,11 +974,12 @@ def list_all_sites(relation="created", phases=None, owner_kind="", owner_id="", 
             raise SystemExit("ListSites exceeded the 100-page safety limit")
         seen_tokens.add(returned_token)
         next_token = returned_token
-    return {
+    summary = {
         "content": [{"type": "text", "text": f"Listed {len(items)} Site control-plane resource(s)."}],
         "structuredContent": {"items": items, "count": len(items)},
         "_meta": {"relation": relation, "read_only": True, "pages": pages, "complete": True},
     }
+    return summary
 
 
 def platform_capabilities(required=True):
@@ -1666,6 +1704,7 @@ def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0)
     last_snapshot = None
     log_cursors = {}
     started_at = time.monotonic()
+    last_heartbeat_at = started_at
     while True:
         remaining = max(1, int(deadline - time.monotonic()))
         arguments = {
@@ -1679,17 +1718,19 @@ def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0)
             {"site_id": site_id, "version_id": version_id},
         )
         payload = structured_content(result)
-        cursor = str(payload.get("cursor") or cursor)
+        cursor = str(payload.get("cursor") or result_resource_version(result) or cursor)
         snapshot = version_stage_snapshot(result)
-        if snapshot != last_snapshot:
+        unchanged = snapshot == last_snapshot
+        if not unchanged:
             print("SiteVersion progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
             last_snapshot = snapshot
-        else:
+        elif time.monotonic() - last_heartbeat_at >= max(30.0, interval_seconds):
             print(
                 f"SiteVersion heartbeat: phase={snapshot.get('phase') or 'unknown'} "
                 f"elapsed_seconds={int(time.monotonic() - started_at)}",
                 file=sys.stderr,
             )
+            last_heartbeat_at = time.monotonic()
         if "GetSiteVersionLogs" in names:
             emit_active_version_log_progress(site_id, version_id, snapshot, log_cursors)
         phase = phase_of(result).lower()
@@ -1714,6 +1755,8 @@ def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0)
             )
         if time.monotonic() >= deadline:
             raise SystemExit(f"timed out waiting for SiteVersion; last progress={json.dumps(snapshot, ensure_ascii=False)}")
+        if unchanged:
+            time.sleep(max(0.25, interval_seconds))
 
 
 def deployment_snapshot(result):
@@ -1731,6 +1774,46 @@ def deployment_snapshot(result):
     }
 
 
+def version_summary(value):
+    structured = structured_content(value) if isinstance(value, dict) and ("structuredContent" in value or "content" in value) else value
+    version = structured.get("version") if isinstance(structured, dict) and isinstance(structured.get("version"), dict) else structured
+    if not isinstance(version, dict):
+        return {}
+    metadata = version.get("metadata") if isinstance(version.get("metadata"), dict) else {}
+    spec = version.get("spec") if isinstance(version.get("spec"), dict) else {}
+    status = version.get("status") if isinstance(version.get("status"), dict) else {}
+    summary = {
+        "id": metadata.get("name"),
+        "uid": metadata.get("uid"),
+        "resourceVersion": metadata.get("resourceVersion"),
+        "createdAt": metadata.get("creationTimestamp"),
+        "phase": status.get("phase"),
+        "source": spec.get("source"),
+        "build": spec.get("build"),
+        "runtime": spec.get("runtime"),
+        "buildPlanRevision": spec.get("buildPlanRevision"),
+        "configSchemaRevision": spec.get("configSchemaRevision"),
+        "sourceBundleDigest": status.get("sourceBundleDigest"),
+        "imageDigest": status.get("imageDigest"),
+        "builder": status.get("builder"),
+        "vulnerabilities": status.get("vulnerabilities"),
+        "runtimeContract": status.get("runtimeContract"),
+        "resolvedRuntime": status.get("resolvedRuntime"),
+    }
+    return {key: item for key, item in summary.items() if item not in (None, "", {}, [])}
+
+
+def version_list_summary(result):
+    structured = structured_content(result)
+    items = structured.get("items") if isinstance(structured, dict) and isinstance(structured.get("items"), list) else []
+    summaries = [version_summary(item) for item in items]
+    return {
+        "content": [{"type": "text", "text": f"Listed {len(summaries)} immutable Site version(s)."}],
+        "structuredContent": {"items": summaries, "count": len(summaries)},
+        "_meta": {"read_only": True},
+    }
+
+
 def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_seconds=5.0):
     names = available_tool_names()
     if "WatchSiteDeployment" not in names:
@@ -1742,6 +1825,7 @@ def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_second
     cursor = ""
     last_snapshot = None
     started_at = time.monotonic()
+    last_heartbeat_at = started_at
     while True:
         remaining = max(1, int(deadline - time.monotonic()))
         arguments = {
@@ -1755,17 +1839,19 @@ def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_second
             {"site_id": site_id, "deployment_id": deployment_id},
         )
         payload = structured_content(result)
-        cursor = str(payload.get("cursor") or cursor)
+        cursor = str(payload.get("cursor") or result_resource_version(result) or cursor)
         snapshot = deployment_snapshot(result)
-        if snapshot != last_snapshot:
+        unchanged = snapshot == last_snapshot
+        if not unchanged:
             print("SiteDeployment progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
             last_snapshot = snapshot
-        else:
+        elif time.monotonic() - last_heartbeat_at >= max(30.0, interval_seconds):
             print(
                 f"SiteDeployment heartbeat: phase={snapshot.get('phase') or 'unknown'} "
                 f"elapsed_seconds={int(time.monotonic() - started_at)}",
                 file=sys.stderr,
             )
+            last_heartbeat_at = time.monotonic()
         phase = phase_of(result).lower()
         if phase == "ready":
             return result
@@ -1778,6 +1864,8 @@ def wait_for_deployment(site_id, deployment_id, timeout_seconds, interval_second
             )
         if time.monotonic() >= deadline:
             raise SystemExit(f"timed out waiting for SiteDeployment; last progress={json.dumps(snapshot, ensure_ascii=False)}")
+        if unchanged:
+            time.sleep(max(0.25, interval_seconds))
 
 
 def release_status_snapshot(result):
@@ -1799,7 +1887,8 @@ def wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds=5
     while True:
         result = call_tool("GetSiteReleaseStatus", {"site_id": site_id, "deployment_id": deployment_id})
         snapshot = release_status_snapshot(result)
-        if snapshot != last:
+        unchanged = snapshot == last
+        if not unchanged:
             print("Site release progress: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
             last = snapshot
         candidate = snapshot.get("candidate")
@@ -1816,6 +1905,8 @@ def wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds=5
             return result, True
         if time.monotonic() >= deadline:
             raise SystemExit("timed out waiting for Site release; last status=" + json.dumps(snapshot, ensure_ascii=False))
+        if unchanged:
+            time.sleep(max(0.25, interval_seconds))
         if "WatchSiteDeployment" in names:
             remaining = max(1, int(deadline - time.monotonic()))
             arguments = {
@@ -2323,6 +2414,7 @@ def build_parser():
         scaling.add_argument("--scale-down-delay-seconds", type=int)
         scaling.add_argument("--initial-scale", type=int)
         if name == "scaling-apply":
+            scaling.add_argument("--confirm", action="store_true")
             scaling.add_argument("--wait", action="store_true")
             add_wait_options(scaling, 900)
 
@@ -2573,10 +2665,11 @@ def main():
             raise SystemExit(3)
         return
     if args.action == "version":
-        print_json(call_tool("GetSiteVersion", {"site_id": selected_site_id(args.site_id), "version_id": args.version_id}))
+        result = call_tool("GetSiteVersion", {"site_id": selected_site_id(args.site_id), "version_id": args.version_id})
+        print_json({"structuredContent": version_summary(result), "_meta": result.get("_meta", {})})
         return
     if args.action == "versions":
-        print_json(call_tool("ListSiteVersions", {"site_id": selected_site_id(args.site_id)}))
+        print_json(version_list_summary(call_tool("ListSiteVersions", {"site_id": selected_site_id(args.site_id)})))
         return
     if args.action == "delete-version":
         if not args.confirm:
@@ -2700,6 +2793,8 @@ def main():
             print_json(call_tool("UpdateSite", arguments))
             return
         plan_arguments = {"site_id": site_id, "scaling_profile": args.profile}
+        if not args.confirm:
+            raise SystemExit("scaling-apply requires --confirm because it creates a new immutable production deployment")
         if policy:
             plan_arguments["scaling"] = policy
         plan = call_tool("PlanSiteScaling", plan_arguments)
@@ -2707,6 +2802,8 @@ def main():
         if not payload.get("valid"):
             raise SystemExit("Site scaling preflight failed:\n" + json.dumps(payload.get("errors") or [], ensure_ascii=False, indent=2))
         plan_revision = str(payload.get("planRevision") or plan.get("_meta", {}).get("plan_revision") or "")
+        if not plan_revision:
+            raise SystemExit("PlanSiteScaling returned no plan_revision; refusing to change production scaling")
         apply_arguments = dict(plan_arguments, plan_revision=plan_revision, confirm=True)
         deployment = call_tool("UpdateSiteScaling", apply_arguments)
         if args.wait:
