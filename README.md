@@ -39,6 +39,24 @@ python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID \
 
 所有生产流量变化都先调用 `PlanSiteDeployment`，再携带短期 `plan_revision` 创建不可变 SiteDeployment。`deploy-local`、`deploy-local-git`、`test-deploy-local`、`test-deploy-current` 和 `release` 共用同一套 release options，不再有绕过 Plan 的 Immediate 快捷路径。
 
+远程 Git 的客户端无法读取提交内容。静态项目在 path 路由环境中必须由调用方显式确认前缀兼容，不能由客户端猜测：
+
+```bash
+python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID \
+  --build '{"mode":"static"}' --confirm-path-prefix-aware
+```
+
+`--confirm-path-prefix-aware` 是源码契约断言，不会重写 HTML/CSS/JS；若不能确认，请省略该参数并让 `PlanSiteVersion` fail closed。
+
+## 自动发布矩阵
+
+```bash
+python3 scripts/al_mcp.py test-release-matrix . \
+  --confirm --confirm-public --cleanup
+```
+
+该命令只操作一个有 UID 记录的专用测试 Site，依次验证 Immediate、带 signed lane 的 Blue-Green、Canary、Promote、Rollback、当前弹性变更与每阶段公网探测。失败时保留 `0600` run manifest 供 `cleanup-test-run` 精确回收；只有完整通过且传入 `--cleanup` 时才自动删除测试 Site。
+
 ## Header 与 Signed Lane
 
 ```bash

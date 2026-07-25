@@ -1204,6 +1204,16 @@ def load_json_object(value):
     return parsed
 
 
+def apply_path_prefix_assertion(build, confirmed):
+    build = dict(build or {})
+    if not confirmed:
+        return build
+    if build.get("path_prefix_aware") is False:
+        raise SystemExit("--confirm-path-prefix-aware contradicts build.path_prefix_aware=false")
+    build["path_prefix_aware"] = True
+    return build
+
+
 def source_relative_path(value, field):
     if not isinstance(value, str) or not value.strip():
         raise SystemExit(f"{field} must be a non-empty SourceBundle-relative path")
@@ -1603,6 +1613,121 @@ def complete_test_deployment(target, run, site_id, saved, version_timeout, deplo
     return ready_version, ready_deployment, smoke
 
 
+def release_matrix_args(base, strategy):
+    canary = base.canary if strategy == "canary" else ""
+    return argparse.Namespace(
+        immediate=strategy == "immediate", blue_green=strategy == "blue-green", canary=canary,
+        step_duration=base.step_duration, step_timeout=base.step_timeout,
+        failure_action="rollback", manual_approval=False,
+        min_requests=None, max_error_rate=None, max_error_rate_increase=None,
+        max_p95_ms=None, max_p95_ratio=None, compare_to_stable=False,
+        max_activation_errors=None, missing_data="wait", sticky=True,
+        sticky_ttl_seconds=86400, signed_lane=[], lane_header=[], lane_ttl_seconds=900,
+        wait=True, wait_candidate=strategy == "blue-green", release_runtime="{}",
+    )
+
+
+def save_matrix_version(path, site_id, build, runtime, timeout, interval):
+    source, plan, saved = save_local_source(path, site_id, build, runtime)
+    version_id = result_meta_id(saved, "version_id")
+    ready = wait_for_version(site_id, version_id, timeout, interval)
+    return {"source": source, "plan": plan, "version": ready, "version_id": version_id}
+
+
+def preflight_release_matrix(args):
+    required = [
+        "GetSitePlatformCapabilities", "CreateSite", "PlanSiteVersion", "SaveSiteVersion",
+        "GetSiteVersion", "PlanSiteDeployment", "DeploySiteVersion", "GetSiteReleaseStatus",
+        "CreateSiteLaneSession", "PromoteSiteDeployment", "RollbackSite",
+        "PlanSiteScaling", "UpdateSiteScaling", "GetSiteScaling",
+    ]
+    if args.cleanup:
+        required.extend(["GetSite", "DeleteSite"])
+    require_tools(*required)
+    # Fail before creating the dedicated Site when the local source is unsafe,
+    # oversized, or has an invalid build contract. save_local_source repeats
+    # this check immediately before packaging to close the TOCTOU window.
+    args.build = json.dumps(normalized_local_build(args.path, args.build))
+    create_source_manifest(args.path)
+
+
+def run_release_matrix(args, target, run, site_id):
+    results = []
+    for strategy in ("immediate", "blue-green", "canary"):
+        saved = save_matrix_version(
+            args.path, site_id, args.build, args.runtime,
+            args.timeout_seconds, args.interval_seconds,
+        )
+        release_args = release_matrix_args(args, strategy)
+        plan, deployment = create_release(release_args, site_id, saved["version_id"])
+        deployment_id = result_meta_id(deployment, "deployment_id")
+        update_test_run(target, run, f"matrix-{strategy}", version=saved["version_id"], deployment=deployment_id)
+        released = finish_release(
+            release_args, site_id, plan, deployment,
+            args.deployment_timeout_seconds, args.interval_seconds, force_wait=True,
+        )
+        entry = {"strategy": strategy, **saved, **released, "deployment_id": deployment_id}
+        if strategy == "blue-green":
+            paused_status, paused = wait_for_release(
+                site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds,
+            )
+            if not paused:
+                raise SystemExit("blue-green matrix release did not pause with a protected candidate")
+            entry["release_status"] = paused_status
+            promoted = call_tool("PromoteSiteDeployment", release_action_arguments(site_id, deployment_id, confirm=True))
+            promoted_status, paused = wait_for_release(
+                site_id, deployment_id, args.deployment_timeout_seconds, args.interval_seconds,
+            )
+            if paused:
+                raise SystemExit("blue-green matrix release remained paused after PromoteSiteDeployment")
+            entry["promote"] = promoted
+            entry["release_status"] = promoted_status
+            entry["public_smoke"] = smoke_public_deployment(promoted_status, site_id)
+        results.append(entry)
+
+    rollback_source = results[-1]["deployment_id"]
+    rollback = call_tool("RollbackSite", {"site_id": site_id, "deployment_id": rollback_source, "confirm": True})
+    rollback_id = result_meta_id(rollback, "deployment_id")
+    rollback_status, paused = wait_for_release(
+        site_id, rollback_id, args.deployment_timeout_seconds, args.interval_seconds,
+    )
+    if paused:
+        raise SystemExit("matrix rollback unexpectedly paused")
+    rollback_result = {
+        "deployment": rollback, "deployment_id": rollback_id, "release_status": rollback_status,
+        "public_smoke": smoke_public_deployment(rollback_status, site_id),
+    }
+
+    scaling_plan = call_tool("PlanSiteScaling", {"site_id": site_id, "scaling_profile": args.scaling_profile})
+    scaling_payload = structured_content(scaling_plan)
+    if not scaling_payload.get("valid"):
+        raise SystemExit("matrix scaling preflight failed:\n" + json.dumps(scaling_payload.get("errors") or [], ensure_ascii=False, indent=2))
+    plan_revision = str(scaling_payload.get("planRevision") or scaling_plan.get("_meta", {}).get("plan_revision") or "")
+    if not plan_revision:
+        raise SystemExit("matrix scaling preflight returned no plan_revision")
+    scaling = call_tool("UpdateSiteScaling", {
+        "site_id": site_id, "scaling_profile": args.scaling_profile,
+        "plan_revision": plan_revision, "confirm": True,
+    })
+    scaling_id = result_meta_id(scaling, "deployment_id")
+    scaling_status, paused = wait_for_release(
+        site_id, scaling_id, args.deployment_timeout_seconds, args.interval_seconds,
+    )
+    if paused:
+        raise SystemExit("matrix scaling deployment unexpectedly paused")
+    scaling_result = {
+        "plan": scaling_plan, "deployment": scaling, "deployment_id": scaling_id,
+        "release_status": scaling_status, "public_smoke": smoke_public_deployment(scaling_status, site_id),
+        "scaling_status": call_tool("GetSiteScaling", {"site_id": site_id}),
+    }
+    run["matrix"] = {
+        "releases": [{"strategy": item["strategy"], "version_id": item["version_id"], "deployment_id": item["deployment_id"]} for item in results],
+        "rollback_deployment_id": rollback_id, "scaling_deployment_id": scaling_id,
+    }
+    update_test_run(target, run, "matrix-ready", deployment=scaling_id)
+    return {"releases": results, "rollback": rollback_result, "scaling": scaling_result}
+
+
 def phase_of(result):
     if isinstance(result, dict):
         meta = result.get("_meta")
@@ -1657,6 +1782,16 @@ def emit_active_version_log_progress(site_id, version_id, snapshot, cursors):
             print(f"SiteVersion {stage} log heartbeat unavailable: {error}", file=sys.stderr)
             return
         payload = structured_content(result)
+        state = str(payload.get("state") or "")
+        if state.lower() == "waiting":
+            reason = str(payload.get("reason") or "ContainerStarting")
+            fingerprint = "waiting:" + reason
+            if cursors.get(stage) != fingerprint:
+                cursors[stage] = fingerprint
+                retry_after = int(payload.get("retryAfterSeconds") or 0)
+                suffix = f"; retry_after_seconds={retry_after}" if retry_after else ""
+                print(f"SiteVersion {stage} logs waiting: {reason}{suffix}", file=sys.stderr)
+            return
         cursor = str(payload.get("cursor") or "")
         content = str(payload.get("content") or "").strip()
         fingerprint = cursor or hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -2281,6 +2416,10 @@ def build_parser():
     save_git.add_argument("commit_sha")
     save_git.add_argument("--submodules", action="store_true")
     save_git.add_argument("--credential-env", default="")
+    save_git.add_argument(
+        "--confirm-path-prefix-aware", action="store_true",
+        help="Explicitly assert that a remote static app works below the Site path prefix",
+    )
     add_save_options(save_git)
     save_oci = sub.add_parser("save-oci")
     save_oci.add_argument("image_digest")
@@ -2317,6 +2456,25 @@ def build_parser():
     add_release_options(test_current)
     add_wait_options(test_current, 1800)
     test_current.add_argument("--deployment-timeout-seconds", type=int, default=900)
+
+    release_matrix = sub.add_parser(
+        "test-release-matrix",
+        help="Create one tracked test Site and verify immediate, blue-green, canary, rollback, scaling, and public probes",
+    )
+    release_matrix.add_argument("path", nargs="?", default=".")
+    release_matrix.add_argument("--display-name", default="AL Site Release Matrix Test")
+    release_matrix.add_argument("--run-file", default="", help="0600 test run manifest path; defaults below AL_SITE_STATE_DIR")
+    release_matrix.add_argument("--confirm-public", action="store_true")
+    release_matrix.add_argument("--confirm", action="store_true", help="Confirm test traffic, rollback, and scaling mutations")
+    release_matrix.add_argument("--cleanup", action="store_true", help="Delete the exact UID-matched test Site after a successful matrix")
+    release_matrix.add_argument("--build", default="{}")
+    release_matrix.add_argument("--runtime", default="{}")
+    release_matrix.add_argument("--canary", default="10,50,100")
+    release_matrix.add_argument("--step-duration", default="1s")
+    release_matrix.add_argument("--step-timeout", default="10m")
+    release_matrix.add_argument("--scaling-profile", choices=("economy", "balanced", "latency", "burst"), default="latency")
+    add_wait_options(release_matrix, 1800)
+    release_matrix.add_argument("--deployment-timeout-seconds", type=int, default=900)
 
     cleanup_test = sub.add_parser("cleanup-test-run", help="Delete only the UID-matched Site recorded by a test run")
     cleanup_test.add_argument("run_file")
@@ -2493,6 +2651,38 @@ def main():
         update_test_run(target, run, "deletion-requested")
         print_json({"run_file": str(target), "site_id": run["site_id"], "deletion": deleted})
         return
+    if args.action == "test-release-matrix":
+        if not args.confirm:
+            raise SystemExit("test-release-matrix requires --confirm before creating versions or changing test traffic")
+        preflight_release_matrix(args)
+        run_id = str(uuid.uuid4())
+        run_target = prepare_test_run_destination(args.run_file, run_id)
+        target, run = begin_test_run("local-release-matrix", str(run_target), run_id)
+        try:
+            _, site_id, _ = create_test_site(
+                args.display_name, args.confirm_public,
+                lambda _created, current_site_id, current_site_uid: record_created_test_site(
+                    target, run, current_site_id, current_site_uid
+                ),
+            )
+            matrix = run_release_matrix(args, target, run, site_id)
+            cleanup = None
+            if args.cleanup:
+                current = call_tool("GetSite", {"site_id": site_id})
+                if result_uid(current) != run["site_uid"]:
+                    raise SystemExit("refusing matrix cleanup: current Site UID differs from the test manifest")
+                cleanup = call_tool("DeleteSite", {
+                    "site_id": site_id, "confirm": True, "expected_uid": run["site_uid"],
+                    "resource_version": result_resource_version(current),
+                })
+                update_test_run(target, run, "deletion-requested")
+        except BaseException as error:
+            run["failure_type"] = type(error).__name__
+            update_test_run(target, run, "failed")
+            print(f"release matrix manifest retained for exact cleanup: {target}", file=sys.stderr)
+            raise
+        print_json({"run_file": str(target), "site_id": site_id, "matrix": matrix, "cleanup": cleanup})
+        return
     if args.action in {"test-deploy-local", "test-deploy-current"}:
         run_id = str(uuid.uuid4())
         run_target = prepare_test_run_destination(args.run_file, run_id)
@@ -2602,7 +2792,8 @@ def main():
             "type": "git", "repository": normalize_git_url(args.repository),
             "commit_sha": args.commit_sha, "submodules": args.submodules,
         }
-        build, runtime = load_json_object(args.build), load_json_object(args.runtime)
+        build = apply_path_prefix_assertion(load_json_object(args.build), args.confirm_path_prefix_aware)
+        runtime = load_json_object(args.runtime)
         site_id = selected_site_id(args.site_id)
         plan = plan_site_version(site_id, "GitCommit", None, build, runtime)
         build, runtime = normalized_inputs_from_plan(plan, build, runtime)

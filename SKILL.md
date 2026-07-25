@@ -43,6 +43,15 @@ python3 scripts/al_mcp.py save-oci IMAGE@sha256:DIGEST --site-id SITE_ID
 python3 scripts/al_mcp.py save-current --handoff @/tmp/al-site-handoff.json --site-id SITE_ID
 ```
 
+For a remote dependency-free static Git commit, the client cannot inspect source files. Only when the caller has verified that all assets, navigation, fetches, and service-worker scope work below the Site path prefix, use:
+
+```bash
+python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID \
+  --build '{"mode":"static"}' --confirm-path-prefix-aware
+```
+
+The flag is an explicit assertion, not a source rewrite. Omit it to fail closed when prefix compatibility is unknown.
+
 Every strong save command calls `PlanSiteVersion` before upload or CR creation. Keep `build.dockerfile` relative to `build.context`; use a numeric non-root final `USER`. Never export an entire Sandbox when only a project subdirectory is needed. Read [references/local-source.md](references/local-source.md), [references/local-git.md](references/local-git.md), or [references/versions.md](references/versions.md) when the source or version workflow is relevant.
 
 ## Plan, release, and observe
@@ -70,6 +79,8 @@ All publishing shortcuts use the same release options:
 Use `release-status DEPLOYMENT_ID --watch` for the product status view. It reports stable/candidate targets, percent, sticky routing, gate snapshots, blocking codes, scaling, and next actions. Do not infer state from arbitrary Condition messages. Exit code `3` means the release is safely paused and requires an explicit action; other failures are nonzero.
 
 Read [references/release.md](references/release.md) before choosing Blue-Green, Canary, metric gates, or rollback behavior.
+
+For a bounded platform regression run, use `test-release-matrix PATH --confirm --confirm-public`. It creates one UID-tracked test Site and verifies Immediate, protected Blue-Green candidate, Promote, Canary, Rollback, current scaling, and public smoke checks. Add `--cleanup` only when the exact test Site should be deleted after success; on failure use the retained run manifest with `cleanup-test-run --confirm`.
 
 ## Validate candidate lanes
 

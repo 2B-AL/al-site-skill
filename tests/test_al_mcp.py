@@ -262,6 +262,34 @@ class SiteClientTest(unittest.TestCase):
             self.assertEqual("static", build["mode"])
             self.assertFalse(build["path_prefix_aware"])
 
+    def test_remote_git_path_prefix_assertion_is_explicit_and_fail_closed(self):
+        parser = al_site.build_parser()
+        args = parser.parse_args([
+            "save-git", "https://example.com/repo.git", "a" * 40,
+            "--confirm-path-prefix-aware",
+        ])
+        self.assertTrue(args.confirm_path_prefix_aware)
+        self.assertEqual(
+            {"mode": "static", "path_prefix_aware": True},
+            al_site.apply_path_prefix_assertion({"mode": "static"}, True),
+        )
+        with self.assertRaisesRegex(SystemExit, "contradicts"):
+            al_site.apply_path_prefix_assertion({"path_prefix_aware": False}, True)
+
+    def test_version_log_waiting_is_progress_not_diagnostic_failure(self):
+        snapshot = {"build": {"state": "Running"}}
+        waiting = {"structuredContent": {
+            "state": "Waiting", "reason": "ContainerCreating", "retryAfterSeconds": 3,
+        }}
+        cursors = {}
+        with mock.patch.object(al_site, "call_tool", return_value=waiting), mock.patch("sys.stderr") as stderr:
+            al_site.emit_active_version_log_progress("site-1", "version-1", snapshot, cursors)
+            al_site.emit_active_version_log_progress("site-1", "version-1", snapshot, cursors)
+        self.assertEqual("waiting:ContainerCreating", cursors["build"])
+        rendered = "".join(str(call) for call in stderr.write.call_args_list)
+        self.assertIn("ContainerCreating", rendered)
+        self.assertNotIn("unavailable", rendered)
+
     def test_source_manifest_digest_includes_file_content(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -331,6 +359,34 @@ class SiteClientTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "confirm-public"):
                 al_site.create_test_site("test", False)
         call.assert_not_called()
+
+    def test_release_matrix_requires_confirmation_before_mutation(self):
+        with mock.patch("sys.argv", ["al_mcp.py", "test-release-matrix", "."]), mock.patch.object(
+            al_site, "call_tool"
+        ) as call:
+            with self.assertRaisesRegex(SystemExit, "requires --confirm"):
+                al_site.main()
+        call.assert_not_called()
+
+    def test_release_matrix_builds_all_release_strategy_contracts(self):
+        parser = al_site.build_parser()
+        base = parser.parse_args([
+            "test-release-matrix", ".", "--confirm", "--confirm-public",
+            "--canary", "10,50,100", "--step-duration", "2s",
+        ])
+        immediate = al_site.release_strategy_from_args(al_site.release_matrix_args(base, "immediate"))
+        blue_green = al_site.release_strategy_from_args(al_site.release_matrix_args(base, "blue-green"))
+        canary = al_site.release_strategy_from_args(al_site.release_matrix_args(base, "canary"))
+        self.assertEqual("immediate", immediate["type"])
+        self.assertEqual("blue-green", blue_green["type"])
+        self.assertEqual("signed-cookie", blue_green["lanes"][0]["mode"])
+        self.assertEqual([10, 50, 100], [step["percent"] for step in canary["steps"]])
+
+    def test_release_matrix_preflight_validates_source_before_mutation(self):
+        parser = al_site.build_parser()
+        args = parser.parse_args(["test-release-matrix", "/missing/project", "--confirm"])
+        with mock.patch.object(al_site, "require_tools"), self.assertRaisesRegex(SystemExit, "does not exist"):
+            al_site.preflight_release_matrix(args)
 
     def test_test_run_manifest_is_0600_and_tracks_exact_site_uid(self):
         with tempfile.TemporaryDirectory() as directory:
