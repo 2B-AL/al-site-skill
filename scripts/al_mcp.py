@@ -1685,7 +1685,12 @@ def run_release_matrix(args, target, run, site_id):
             entry["public_smoke"] = smoke_public_deployment(promoted_status, site_id)
         results.append(entry)
 
-    rollback_source = results[-1]["deployment_id"]
+    # RollbackSite accepts a historical deployment as the desired target. The
+    # final matrix entry is the currently active Canary deployment, so passing
+    # it asks the platform to "roll back" to the active release and correctly
+    # fails planning. Exercise a real rollback to the most recent historical
+    # release instead.
+    rollback_source = release_matrix_rollback_target(results)
     rollback = call_tool("RollbackSite", {"site_id": site_id, "deployment_id": rollback_source, "confirm": True})
     rollback_id = result_meta_id(rollback, "deployment_id")
     rollback_status, paused = wait_for_release(
@@ -1718,7 +1723,14 @@ def run_release_matrix(args, target, run, site_id):
     scaling_result = {
         "plan": scaling_plan, "deployment": scaling, "deployment_id": scaling_id,
         "release_status": scaling_status, "public_smoke": smoke_public_deployment(scaling_status, site_id),
-        "scaling_status": call_tool("GetSiteScaling", {"site_id": site_id}),
+        # VMP ingestion is asynchronous. A single immediate read can report a
+        # false-negative missingSeries result even though the release and
+        # ServiceMonitor are healthy. Keep the matrix authoritative by waiting
+        # for an observed scaling sample within the existing deployment
+        # deadline.
+        "scaling_status": wait_for_scaling_metrics(
+            site_id, args.deployment_timeout_seconds, args.interval_seconds,
+        ),
     }
     run["matrix"] = {
         "releases": [{"strategy": item["strategy"], "version_id": item["version_id"], "deployment_id": item["deployment_id"]} for item in results],
@@ -1726,6 +1738,43 @@ def run_release_matrix(args, target, run, site_id):
     }
     update_test_run(target, run, "matrix-ready", deployment=scaling_id)
     return {"releases": results, "rollback": rollback_result, "scaling": scaling_result}
+
+
+def release_matrix_rollback_target(results):
+    if len(results) < 2:
+        raise SystemExit("release matrix needs an active and a historical deployment before rollback")
+    active = str(results[-1].get("deployment_id") or "")
+    for entry in reversed(results[:-1]):
+        deployment_id = str(entry.get("deployment_id") or "")
+        if deployment_id and deployment_id != active:
+            return deployment_id
+    raise SystemExit("release matrix did not retain a distinct historical deployment for rollback")
+
+
+def wait_for_scaling_metrics(site_id, timeout_seconds, interval_seconds=5.0):
+    deadline = time.monotonic() + timeout_seconds
+    last = None
+    while True:
+        result = call_tool("GetSiteScaling", {"site_id": site_id})
+        payload = structured_content(result)
+        if payload.get("available") is True:
+            return result
+        snapshot = {
+            "configured": payload.get("configured"),
+            "available": payload.get("available"),
+            "phase": payload.get("phase"),
+        }
+        if snapshot != last:
+            print("Site scaling metrics waiting: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+            last = snapshot
+        if payload.get("configured") is False:
+            raise SystemExit("Site scaling metrics are not configured for this environment")
+        if time.monotonic() >= deadline:
+            raise SystemExit(
+                "timed out waiting for Site scaling metrics; last status="
+                + json.dumps(snapshot, ensure_ascii=False)
+            )
+        time.sleep(max(0.25, interval_seconds))
 
 
 def phase_of(result):

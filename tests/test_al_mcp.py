@@ -388,6 +388,36 @@ class SiteClientTest(unittest.TestCase):
         with mock.patch.object(al_site, "require_tools"), self.assertRaisesRegex(SystemExit, "does not exist"):
             al_site.preflight_release_matrix(args)
 
+    def test_release_matrix_rolls_back_to_a_historical_deployment(self):
+        releases = [
+            {"strategy": "immediate", "deployment_id": "deployment-immediate"},
+            {"strategy": "blue-green", "deployment_id": "deployment-blue-green"},
+            {"strategy": "canary", "deployment_id": "deployment-canary"},
+        ]
+        self.assertEqual("deployment-blue-green", al_site.release_matrix_rollback_target(releases))
+
+    def test_release_matrix_refuses_rollback_without_distinct_history(self):
+        with self.assertRaisesRegex(SystemExit, "active and a historical"):
+            al_site.release_matrix_rollback_target([{"deployment_id": "deployment-active"}])
+
+    def test_release_matrix_waits_for_observed_scaling_metrics(self):
+        waiting = {"structuredContent": {"configured": True, "available": False, "phase": "Ready"}}
+        ready = {"structuredContent": {"configured": True, "available": True, "phase": "Ready"}}
+        with mock.patch.object(al_site, "call_tool", side_effect=[waiting, ready]) as call, mock.patch.object(
+            al_site.time, "sleep"
+        ) as sleep:
+            result = al_site.wait_for_scaling_metrics("site-1", 30, 1)
+        self.assertIs(result, ready)
+        self.assertEqual(2, call.call_count)
+        sleep.assert_called_once_with(1)
+
+    def test_release_matrix_fails_closed_when_scaling_metrics_are_disabled(self):
+        disabled = {"structuredContent": {"configured": False, "available": False}}
+        with mock.patch.object(al_site, "call_tool", return_value=disabled), self.assertRaisesRegex(
+            SystemExit, "not configured"
+        ):
+            al_site.wait_for_scaling_metrics("site-1", 30, 1)
+
     def test_test_run_manifest_is_0600_and_tracks_exact_site_uid(self):
         with tempfile.TemporaryDirectory() as directory:
             run_id = "11111111-1111-1111-1111-111111111111"
