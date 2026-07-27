@@ -1850,8 +1850,11 @@ def version_stage_snapshot(result):
             snapshot[stage] = {
                 "state": value.get("state"), "attempt": value.get("attempt"),
                 "errorClass": value.get("errorClass"), "errorCode": value.get("errorCode"),
+                "diagnosticCode": value.get("diagnosticCode"),
+                "lastFailureAt": value.get("lastFailureAt"), "retryAt": value.get("retryAt"),
             }
     snapshot["phase"] = status.get("phase")
+    snapshot["manualBuildRetries"] = status.get("manualBuildRetries")
     return snapshot
 
 
@@ -1913,7 +1916,7 @@ def watch_or_get(watch_tool, get_tool, arguments, get_arguments):
         return call_tool(get_tool, get_arguments)
 
 
-def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0):
+def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0, minimum_manual_build_retries=None):
     names = available_tool_names()
     if "WatchSiteVersion" not in names:
         return wait_for(
@@ -1958,6 +1961,13 @@ def wait_for_version(site_id, version_id, timeout_seconds, interval_seconds=5.0)
         if phase == "ready":
             return result
         if phase == "failed":
+            if minimum_manual_build_retries is not None:
+                observed = int(snapshot.get("manualBuildRetries") or 0)
+                if observed < minimum_manual_build_retries:
+                    if time.monotonic() >= deadline:
+                        raise SystemExit("timed out waiting for the confirmed build retry to start")
+                    time.sleep(max(0.25, interval_seconds))
+                    continue
             diagnostics = {}
             if "GetSiteVersionLogs" in names:
                 for stage, value in snapshot.items():
@@ -2003,6 +2013,16 @@ def version_summary(value):
     metadata = version.get("metadata") if isinstance(version.get("metadata"), dict) else {}
     spec = version.get("spec") if isinstance(version.get("spec"), dict) else {}
     status = version.get("status") if isinstance(version.get("status"), dict) else {}
+    stages = {}
+    for stage in ("source", "build", "scan"):
+        raw = status.get(stage)
+        if not isinstance(raw, dict):
+            continue
+        projected = {key: raw.get(key) for key in (
+            "state", "attempt", "startedAt", "completedAt", "lastFailureAt", "retryAt",
+            "timingsMillis", "errorClass", "errorCode", "diagnosticCode",
+        )}
+        stages[stage] = {key: item for key, item in projected.items() if item not in (None, "", {}, [])}
     summary = {
         "id": metadata.get("name"),
         "uid": metadata.get("uid"),
@@ -2020,6 +2040,8 @@ def version_summary(value):
         "vulnerabilities": status.get("vulnerabilities"),
         "runtimeContract": status.get("runtimeContract"),
         "resolvedRuntime": status.get("resolvedRuntime"),
+        "stages": stages,
+        "manualBuildRetries": status.get("manualBuildRetries"),
     }
     return {key: item for key, item in summary.items() if item not in (None, "", {}, [])}
 
@@ -2588,6 +2610,12 @@ def build_parser():
     delete_version.add_argument("version_id")
     add_site_id(delete_version)
     delete_version.add_argument("--confirm", action="store_true")
+    retry_version = sub.add_parser("retry-version")
+    retry_version.add_argument("version_id")
+    add_site_id(retry_version)
+    retry_version.add_argument("--confirm", action="store_true")
+    retry_version.add_argument("--wait", action="store_true")
+    add_wait_options(retry_version, 1800)
     version_diff = sub.add_parser("version-diff")
     version_diff.add_argument("version_a")
     version_diff.add_argument("version_b")
@@ -2960,6 +2988,32 @@ def main():
             "site_id": site_id, "version_id": args.version_id, "expected_uid": uid,
             "resource_version": resource_version, "confirm": True,
         }))
+        return
+    if args.action == "retry-version":
+        if not args.confirm:
+            raise SystemExit("retry-version requires --confirm because it consumes a bounded build retry budget")
+        site_id = selected_site_id(args.site_id)
+        current = call_tool("GetSiteVersion", {"site_id": site_id, "version_id": args.version_id})
+        uid, resource_version = result_uid(current), result_resource_version(current)
+        if not uid or not resource_version:
+            raise SystemExit("refusing version retry: GetSiteVersion did not return current UID and resourceVersion")
+        current_structured = structured_content(current)
+        current_version = current_structured.get("version") if isinstance(current_structured.get("version"), dict) else current_structured
+        current_status = current_version.get("status") if isinstance(current_version, dict) else None
+        if not isinstance(current_status, dict):
+            current_status = {}
+        expected_retry_count = int(current_status.get("manualBuildRetries") or 0) + 1
+        accepted = call_tool("RetrySiteVersion", {
+            "site_id": site_id, "version_id": args.version_id, "expected_uid": uid,
+            "resource_version": resource_version, "confirm": True,
+        })
+        if args.wait:
+            print_json({"retry": accepted, "version": wait_for_version(
+                site_id, args.version_id, args.timeout_seconds, args.interval_seconds,
+                minimum_manual_build_retries=expected_retry_count,
+            )})
+        else:
+            print_json(accepted)
         return
     if args.action == "version-diff":
         print_json(call_tool("CompareSiteVersions", {

@@ -48,7 +48,7 @@ python3 scripts/al_mcp.py set-site-access-policy \
 | `cleanup-test-run RUN_FILE --confirm` | UID 复核后仅删除该清单创建的测试 Site 及其受控子资源 |
 | `save-git` / `save-local-git` | `SaveSiteVersion(git)` |
 | `save-oci` | `SaveSiteVersion(oci)` |
-| `version` / `versions` / `version-diff` / `wait-version` / `delete-version` | immutable Version query, comparison, watch, and preconditioned deletion |
+| `version` / `versions` / `version-diff` / `wait-version` / `retry-version` / `delete-version` | immutable Version query, comparison, watch, bounded build retry, and preconditioned deletion |
 | `release-plan` / `release` / `deploy` | `PlanSiteDeployment` then `DeploySiteVersion(plan_revision)` |
 | `release-status` | structured `GetSiteReleaseStatus`; `--watch` exits 3 on actionable pause |
 | `open-lane` / `revoke-lane` | signed candidate session and epoch revocation |

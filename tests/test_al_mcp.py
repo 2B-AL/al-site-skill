@@ -61,6 +61,7 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual("accessible", parser.parse_args(["sites", "--relation", "accessible"]).relation)
         self.assertEqual("accessible", parser.parse_args(["get", "shared", "--relation", "accessible"]).relation)
         self.assertEqual("delete-version", parser.parse_args(["delete-version", "version-1", "--confirm"]).action)
+        self.assertEqual("retry-version", parser.parse_args(["retry-version", "version-1", "--confirm"]).action)
 
     def test_gateway_url_validation(self):
         self.assertEqual("https://gateway.example", al_site.validate_gateway_url("https://gateway.example/mcp"))
@@ -542,6 +543,19 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual("WatchSiteVersion", call.call_args_list[0].args[0])
         self.assertEqual("GetSiteVersion", call.call_args_list[1].args[0])
 
+    def test_wait_version_does_not_report_pre_retry_failed_snapshot(self):
+        responses = [
+            {"structuredContent": {"cursor": "20", "version": {"status": {"phase": "Failed", "manualBuildRetries": 0, "build": {"state": "Failed", "attempt": 3}}}}},
+            {"structuredContent": {"cursor": "21", "version": {"status": {"phase": "Building", "manualBuildRetries": 1, "build": {"state": "Running", "attempt": 4}}}}},
+            {"structuredContent": {"cursor": "22", "terminal": True, "version": {"status": {"phase": "Ready", "manualBuildRetries": 1, "build": {"state": "Succeeded", "attempt": 4}}}}},
+        ]
+        with mock.patch.object(al_site, "available_tool_names", return_value={"WatchSiteVersion"}), mock.patch.object(
+            al_site, "call_tool", side_effect=responses
+        ) as call, mock.patch.object(al_site.time, "sleep"):
+            result = al_site.wait_for_version("site-1", "version-1", 30, minimum_manual_build_retries=1)
+        self.assertEqual("Ready", al_site.phase_of(result))
+        self.assertEqual("20", call.call_args_list[1].args[1]["cursor"])
+
     def test_public_smoke_resolves_shared_path_url_from_site(self):
         deployment = {"structuredContent": {"deployment": {"status": {"phase": "Ready"}}}}
         site = {"structuredContent": {"status": {"url": "https://site.example/sites/demo/"}}}
@@ -602,6 +616,19 @@ class SiteClientTest(unittest.TestCase):
             al_site.main()
         self.assertEqual(mock.call("GetSiteVersion", {"site_id": "site-1", "version_id": "version-1"}), call.call_args_list[0])
         self.assertEqual(mock.call("DeleteSiteVersion", {
+            "site_id": "site-1", "version_id": "version-1", "expected_uid": "version-uid",
+            "resource_version": "77", "confirm": True,
+        }), call.call_args_list[1])
+
+    def test_retry_version_reads_and_forwards_exact_identity(self):
+        current = {"structuredContent": {"metadata": {"uid": "version-uid", "resourceVersion": "77"}}}
+        accepted = {"structuredContent": {"status": "RetryingBuild"}}
+        with mock.patch("sys.argv", ["al_mcp.py", "retry-version", "version-1", "--site-id", "site-1", "--confirm"]), mock.patch.object(
+            al_site, "call_tool", side_effect=[current, accepted]
+        ) as call, mock.patch.object(al_site, "print_json"):
+            al_site.main()
+        self.assertEqual(mock.call("GetSiteVersion", {"site_id": "site-1", "version_id": "version-1"}), call.call_args_list[0])
+        self.assertEqual(mock.call("RetrySiteVersion", {
             "site_id": "site-1", "version_id": "version-1", "expected_uid": "version-uid",
             "resource_version": "77", "confirm": True,
         }), call.call_args_list[1])
@@ -724,13 +751,19 @@ class SiteClientTest(unittest.TestCase):
         summary = al_site.version_summary({"structuredContent": {
             "metadata": {"name": "version-1", "uid": "uid-1", "resourceVersion": "42", "managedFields": ["noise"]},
             "spec": {"buildPlanRevision": "static-v1", "build": {"mode": "Static"}},
-            "status": {"phase": "Ready", "imageDigest": "registry/site@sha256:abc", "source": {"jobRef": "job-1"}, "conditions": ["noise"]},
+            "status": {"phase": "Ready", "imageDigest": "registry/site@sha256:abc", "source": {
+                "lastJobRef": {"namespace": "internal", "name": "job-1"}, "logRef": "pod/internal",
+                "state": "Succeeded", "attempt": 1, "diagnosticCode": "buildkit.base-image.request-timeout",
+            }, "conditions": ["noise"]},
         }})
         self.assertEqual("version-1", summary["id"])
         self.assertEqual("registry/site@sha256:abc", summary["imageDigest"])
         self.assertNotIn("metadata", summary)
         self.assertNotIn("conditions", summary)
         self.assertNotIn("source", summary.get("status", {}))
+        self.assertEqual("buildkit.base-image.request-timeout", summary["stages"]["source"]["diagnosticCode"])
+        self.assertNotIn("lastJobRef", summary["stages"]["source"])
+        self.assertNotIn("logRef", summary["stages"]["source"])
 
     def test_active_version_log_progress_is_cursor_deduplicated(self):
         response = {"structuredContent": {"cursor": "2026-07-22T12:00:00Z", "content": "vertex 1\nvertex 2"}}

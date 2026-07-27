@@ -131,3 +131,14 @@ python3 scripts/al_mcp.py deployment DEPLOYMENT_ID --site-id SITE_ID
 ```
 
 `wait-version` 使用带 cursor 的长轮询；即使没有状态变化也会周期性返回 heartbeat，而不是让 Agent 盲等。失败时使用 owner-scoped 的 `GetSiteVersionLogs`，不接受调用方提供 namespace/Pod/container。以返回的 `phase`、stage、attempt、conditions、错误 code 和真实 URL 为准，不用 Pod Ready 或客户端 HTTP timeout 代替业务状态。
+
+当 `build.errorClass=Transient` 且源码已经固化时，先查看
+`build.diagnosticCode` 和 `build.retryAt`。自动重试会等待持久化的退避门禁；
+预算耗尽后，只有在用户明确确认时执行：
+
+```bash
+python3 scripts/al_mcp.py retry-version VERSION_ID --site-id SITE_ID --confirm --wait
+```
+
+不要对 `PolicyDenied`、`InvalidInput`、漏洞扫描、runtime contract 或
+preview 失败使用构建重试；不要用创建多个新版本的方式放大同一个瞬态故障。

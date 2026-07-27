@@ -19,6 +19,23 @@ python3 scripts/al_mcp.py wait-version VERSION_ID
 
 Wait for real `phase=Ready`; do not treat SourceBundle upload or image build completion alone as deployable.
 
+For a terminal transient build failure after `SourceResolved=True`, retry the
+same immutable SourceBundle without creating another Version:
+
+```bash
+python3 scripts/al_mcp.py retry-version VERSION_ID --confirm --wait
+```
+
+The command refreshes UID and resourceVersion before calling the protected
+retry tool. The platform persists an exponential `retryAt` gate for automatic
+attempts and exposes a non-sensitive `diagnosticCode`, such as
+`buildkit.base-image.request-timeout`. A manual retry starts a new bounded
+build-only attempt window; it never replays Git or Sandbox source import.
+
+Do not use it for policy, vulnerability, runtime-contract, or preview failures.
+Versions that used ephemeral BuildKit secrets must be saved again with fresh
+secret material because the original values are deliberately destroyed.
+
 ## History and comparison
 
 ```bash

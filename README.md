@@ -20,6 +20,7 @@ python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID --immediate
 # 版本历史与差异
 python3 scripts/al_mcp.py versions --site-id SITE_ID
 python3 scripts/al_mcp.py version-diff VERSION_A VERSION_B --site-id SITE_ID
+python3 scripts/al_mcp.py retry-version VERSION_ID --site-id SITE_ID --confirm --wait
 python3 scripts/al_mcp.py delete-version VERSION_ID --site-id SITE_ID --confirm
 
 # Immediate

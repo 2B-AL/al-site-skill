@@ -115,6 +115,7 @@ The client first reads current step, phase, routing epoch, UID, and resource ver
 python3 scripts/al_mcp.py versions
 python3 scripts/al_mcp.py version VERSION_ID
 python3 scripts/al_mcp.py version-diff VERSION_A VERSION_B
+python3 scripts/al_mcp.py retry-version VERSION_ID --confirm --wait
 python3 scripts/al_mcp.py delete-version VERSION_ID --confirm
 
 python3 scripts/al_mcp.py scaling-status
@@ -126,7 +127,7 @@ python3 scripts/al_mcp.py scaling-apply --profile custom \
 
 `GetSiteScaling`, `GetSiteMetrics`, and `GetSiteUsage` are read-only and may consume one bounded MCP retry when the Manager explicitly reports a retryable observability 429/502/503/504. Workflow waits continue within their existing deadline after that budget is exhausted. Never extend this behavior to release, promotion, rollback, scaling apply, or any other mutating tool, and never turn unavailable metrics into a passing gate.
 
-Resume never resets the observation window. If structured status reports `PausedStepTimeoutElapsed`, require the user to choose `resume --extend-timeout DURATION` or rollback. `delete-version` first reads the latest Version UID and resourceVersion, then forwards both with explicit confirmation; the platform refuses active or otherwise referenced Versions. `scaling-set-defaults` changes future defaults only. `scaling-apply --confirm` plans and creates a new immutable Deployment for the active Version. Never describe a defaults update as changing current production. Read [references/scaling.md](references/scaling.md) and [references/versions.md](references/versions.md).
+Resume never resets the observation window. If structured status reports `PausedStepTimeoutElapsed`, require the user to choose `resume --extend-timeout DURATION` or rollback. `retry-version` is only for a terminal transient build after SourceBundle resolution; it reuses the same immutable source, consumes a bounded retry budget, and refuses versions that used expired build secrets. It is not a way to retry source, policy, scan, or runtime-contract failures. `delete-version` first reads the latest Version UID and resourceVersion, then forwards both with explicit confirmation; the platform refuses active or otherwise referenced Versions. `scaling-set-defaults` changes future defaults only. `scaling-apply --confirm` plans and creates a new immutable Deployment for the active Version. Never describe a defaults update as changing current production. Read [references/scaling.md](references/scaling.md) and [references/versions.md](references/versions.md).
 
 ## Preserve safety boundaries
 
