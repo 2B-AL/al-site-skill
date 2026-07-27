@@ -930,6 +930,29 @@ def call_tool_result(name, arguments):
     return result
 
 
+def retryable_observability_error(result):
+    if not isinstance(result, dict) or result.get("isError") is not True:
+        return False
+    meta = result.get("_meta")
+    if not isinstance(meta, dict) or meta.get("retryable") is not True:
+        return False
+    return str(meta.get("error_code") or "") in {
+        "ObservabilityUnavailable", "VMPQueryFailed",
+    }
+
+
+def bounded_tool_error(result):
+    meta = result.get("_meta") if isinstance(result, dict) else None
+    if not isinstance(meta, dict):
+        meta = {}
+    return {
+        "code": str(meta.get("error_code") or "Unknown"),
+        "request_id": str(meta.get("request_id") or ""),
+        "read_attempts": meta.get("read_attempts"),
+        "message": result_text(result),
+    }
+
+
 def available_tool_names():
     result = rpc("tools/list")
     return {str(item.get("name") or "") for item in result.get("tools", []) if isinstance(item, dict)}
@@ -1755,7 +1778,21 @@ def wait_for_scaling_metrics(site_id, timeout_seconds, interval_seconds=5.0):
     deadline = time.monotonic() + timeout_seconds
     last = None
     while True:
-        result = call_tool("GetSiteScaling", {"site_id": site_id})
+        result = call_tool_result("GetSiteScaling", {"site_id": site_id})
+        if isinstance(result, dict) and result.get("isError"):
+            if not retryable_observability_error(result):
+                raise SystemExit(result_text(result))
+            snapshot = {"available": False, "error": bounded_tool_error(result)}
+            if snapshot != last:
+                print("Site scaling metrics temporarily unavailable: " + json.dumps(snapshot, ensure_ascii=False), file=sys.stderr)
+                last = snapshot
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    "timed out waiting for Site scaling metrics; last status="
+                    + json.dumps(snapshot, ensure_ascii=False)
+                )
+            time.sleep(max(0.25, min(interval_seconds, deadline - time.monotonic())))
+            continue
         payload = structured_content(result)
         if payload.get("available") is True:
             return result

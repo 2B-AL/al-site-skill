@@ -124,6 +124,8 @@ python3 scripts/al_mcp.py scaling-apply --profile custom \
   --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
 ```
 
+`GetSiteScaling`, `GetSiteMetrics`, and `GetSiteUsage` are read-only and may consume one bounded MCP retry when the Manager explicitly reports a retryable observability 429/502/503/504. Workflow waits continue within their existing deadline after that budget is exhausted. Never extend this behavior to release, promotion, rollback, scaling apply, or any other mutating tool, and never turn unavailable metrics into a passing gate.
+
 Resume never resets the observation window. If structured status reports `PausedStepTimeoutElapsed`, require the user to choose `resume --extend-timeout DURATION` or rollback. `delete-version` first reads the latest Version UID and resourceVersion, then forwards both with explicit confirmation; the platform refuses active or otherwise referenced Versions. `scaling-set-defaults` changes future defaults only. `scaling-apply --confirm` plans and creates a new immutable Deployment for the active Version. Never describe a defaults update as changing current production. Read [references/scaling.md](references/scaling.md) and [references/versions.md](references/versions.md).
 
 ## Preserve safety boundaries

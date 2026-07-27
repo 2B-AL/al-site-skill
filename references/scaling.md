@@ -39,6 +39,8 @@ python3 scripts/al_mcp.py scaling-status
 
 The response distinguishes `configured` from `available`. When available it includes the active profile/policy and bounded VMP/Knative values such as desired/current/ready replicas, concurrency, queue depth, scale events, cold-start latency, activation errors, scale-to-zero, and quota headroom. Missing backend data must be shown as unavailable, not fabricated as zero.
 
+The MCP retries an explicitly retryable observability read once with a short jittered delay. A matrix wait that still receives `ObservabilityUnavailable` keeps the same overall deadline and reports bounded error metadata while waiting for recovery. It does not reuse stale data, reset a release observation window, or retry any mutation.
+
 ## Release interaction
 
 Candidate scaling is fixed in that Deployment's runtime snapshot. Plan must account for stable and candidate worst-case coexistence. A rollback restores the historical Deployment scaling snapshot. A 0% Blue-Green candidate may scale from zero when a signed lane request arrives.

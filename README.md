@@ -94,7 +94,7 @@ python3 scripts/al_mcp.py scaling-apply --profile custom \
   --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
 ```
 
-`scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。
+`scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。只读指标工具会在 MCP 层对明确标记为 retryable 的 VMP 429/502/503/504 做一次短退避重试；矩阵等待仍受原始总 deadline 约束，持续故障会返回最后的错误码、请求 ID 和读取 attempt，而不会推进发布。
 
 ## 独立与组合使用
 

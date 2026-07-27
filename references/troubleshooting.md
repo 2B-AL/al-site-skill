@@ -13,7 +13,7 @@ python3 scripts/al_mcp.py release-status DEPLOYMENT_ID --watch
 - `DeploymentPlanStale`：客户端只会对完全相同的可见意图重新 Plan 一次；再次失败则重新检查 active rollout。
 - `ManualApprovalRequired`：先用 signed/header lane 验证 candidate，再 `promote --confirm` 或 rollback。
 - `MetricSamplesInsufficient`：显示当前样本，继续等或产生预期流量；不要强制当作 pass。
-- `ObservabilityUnavailable`：stable 保持不变，检查 VMP workspace、prometheus-agent、ServiceMonitor 和 Adapter readiness。
+- `ObservabilityUnavailable`：stable 保持不变。只读指标工具会先执行一次有界重试；工作流等待在原有 deadline 内继续观察。持续失败时使用返回的 request ID 检查 VMP workspace、prometheus-agent、ServiceMonitor 和 Adapter readiness，不得使用旧指标或强制推进。
 - `RollbackBlockedByMigration`：数据库不会回滚；要求应用/迁移兼容性 review，使用 `failureAction=pause`。
 - `ScalingQuotaExceeded`：按 capability 的 quota/headroom 降低 candidate maxScale。
 

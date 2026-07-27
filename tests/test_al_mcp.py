@@ -403,7 +403,7 @@ class SiteClientTest(unittest.TestCase):
     def test_release_matrix_waits_for_observed_scaling_metrics(self):
         waiting = {"structuredContent": {"configured": True, "available": False, "phase": "Ready"}}
         ready = {"structuredContent": {"configured": True, "available": True, "phase": "Ready"}}
-        with mock.patch.object(al_site, "call_tool", side_effect=[waiting, ready]) as call, mock.patch.object(
+        with mock.patch.object(al_site, "call_tool_result", side_effect=[waiting, ready]) as call, mock.patch.object(
             al_site.time, "sleep"
         ) as sleep:
             result = al_site.wait_for_scaling_metrics("site-1", 30, 1)
@@ -413,10 +413,42 @@ class SiteClientTest(unittest.TestCase):
 
     def test_release_matrix_fails_closed_when_scaling_metrics_are_disabled(self):
         disabled = {"structuredContent": {"configured": False, "available": False}}
-        with mock.patch.object(al_site, "call_tool", return_value=disabled), self.assertRaisesRegex(
+        with mock.patch.object(al_site, "call_tool_result", return_value=disabled), self.assertRaisesRegex(
             SystemExit, "not configured"
         ):
             al_site.wait_for_scaling_metrics("site-1", 30, 1)
+
+    def test_release_matrix_waits_through_retryable_observability_failure(self):
+        unavailable = {
+            "isError": True,
+            "content": [{"type": "text", "text": "observability backend returned 502 Bad Gateway"}],
+            "_meta": {
+                "error_code": "ObservabilityUnavailable",
+                "retryable": True,
+                "request_id": "req-vmp",
+                "read_attempts": 2,
+            },
+        }
+        ready = {"structuredContent": {"configured": True, "available": True, "phase": "Ready"}}
+        with mock.patch.object(al_site, "call_tool_result", side_effect=[unavailable, ready]) as call, mock.patch.object(
+            al_site.time, "sleep"
+        ) as sleep:
+            result = al_site.wait_for_scaling_metrics("site-1", 30, 1)
+        self.assertIs(result, ready)
+        self.assertEqual(2, call.call_count)
+        sleep.assert_called_once_with(1)
+
+    def test_release_matrix_does_not_wait_through_nonretryable_metrics_error(self):
+        denied = {
+            "isError": True,
+            "content": [{"type": "text", "text": "permission denied"}],
+            "_meta": {"error_code": "Unauthorized", "retryable": False, "request_id": "req-denied"},
+        }
+        with mock.patch.object(al_site, "call_tool_result", return_value=denied), mock.patch.object(
+            al_site.time, "sleep"
+        ) as sleep, self.assertRaisesRegex(SystemExit, "permission denied"):
+            al_site.wait_for_scaling_metrics("site-1", 30, 1)
+        sleep.assert_not_called()
 
     def test_test_run_manifest_is_0600_and_tracks_exact_site_uid(self):
         with tempfile.TemporaryDirectory() as directory:
