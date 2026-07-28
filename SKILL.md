@@ -123,7 +123,12 @@ python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
 python3 scripts/al_mcp.py scaling-apply --profile latency --confirm --wait
 python3 scripts/al_mcp.py scaling-apply --profile custom \
   --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
+
+python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-browser
+python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
+
+`observe` first asks Site MCP to re-authorize the selected Site and then returns a short-lived AL OAuth protected Grafana link scoped to that immutable Site UID. Never construct Grafana URLs or tenant query parameters manually. Dashboard-link failure is diagnostic only and must not change build, release, rollback, or scaling state.
 
 `GetSiteScaling`, `GetSiteMetrics`, and `GetSiteUsage` are read-only and may consume one bounded MCP retry when the Manager explicitly reports a retryable observability 429/502/503/504. Workflow waits continue within their existing deadline after that budget is exhausted. Never extend this behavior to release, promotion, rollback, scaling apply, or any other mutating tool, and never turn unavailable metrics into a passing gate.
 

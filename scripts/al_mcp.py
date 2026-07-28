@@ -2515,6 +2515,11 @@ def build_parser():
     get = sub.add_parser("get")
     get.add_argument("site_id", nargs="?", default="")
     get.add_argument("--relation", choices=("created", "accessible"), default="created")
+    observe = sub.add_parser("observe", help="Open a short-lived AL OAuth protected dashboard for a Site")
+    observe.add_argument("site_id", nargs="?", default="")
+    observe.add_argument("--dashboard", choices=("overview", "rollout"), default="overview")
+    observe.add_argument("--time-range", choices=("15m", "1h", "6h", "24h", "7d", "30d"), default="1h")
+    observe.add_argument("--open-browser", action="store_true")
 
     save_current = sub.add_parser("save-current")
     save_current.add_argument("--handoff", default="", help="Explicit one-time Sandbox handoff JSON or @file.json")
@@ -2884,6 +2889,17 @@ def main():
         return
     if args.action == "get":
         print_json(call_tool("GetSite", {"site_id": selected_site_id(args.site_id), "relation": args.relation}))
+        return
+    if args.action == "observe":
+        result = call_tool("GetSiteObservabilityLink", {
+            "site_id": selected_site_id(args.site_id),
+            "dashboard": args.dashboard,
+            "time_range": args.time_range,
+        })
+        link = str(structured_content(result).get("url") or "")
+        if args.open_browser and link:
+            webbrowser.open(link)
+        print_json(result)
         return
     if args.action == "save-current":
         if not args.handoff:

@@ -93,7 +93,12 @@ python3 scripts/al_mcp.py scaling-set-defaults --profile balanced
 python3 scripts/al_mcp.py scaling-apply --profile latency --confirm --wait
 python3 scripts/al_mcp.py scaling-apply --profile custom \
   --min-scale 1 --max-scale 20 --target-concurrency 20 --confirm --wait
+
+python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-browser
+python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
+
+`observe` 会先通过 Site MCP 重新校验当前调用者对 Site 的访问关系，再返回绑定不可变 Site UID 的短期 AL OAuth Grafana 链接。不要手工拼 Grafana URL 或租户查询参数；看板不可用不会改变构建、发布、回滚或弹性状态。
 
 `scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。只读指标工具会在 MCP 层对明确标记为 retryable 的 VMP 429/502/503/504 做一次短退避重试；矩阵等待仍受原始总 deadline 约束，持续故障会返回最后的错误码、请求 ID 和读取 attempt，而不会推进发布。
 
