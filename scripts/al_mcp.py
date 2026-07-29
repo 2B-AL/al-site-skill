@@ -928,6 +928,21 @@ def archive_conversation_site():
     return result
 
 
+def clear_selected_site_if_matches(site_id):
+    expected = str(site_id or "").strip()
+    if not expected:
+        return False
+
+    def clear(state):
+        if str(state.get("site_id") or "").strip() != expected:
+            return False
+        for key in ("site_id", "version_id", "deployment_id"):
+            state.pop(key, None)
+        return True
+
+    return bool(update_state(clear))
+
+
 def result_text(result):
     if not isinstance(result, dict):
         return str(result)
@@ -2902,7 +2917,11 @@ def main():
             "resource_version": resource_version,
         })
         update_test_run(target, run, "deletion-requested")
-        print_json({"run_file": str(target), "site_id": run["site_id"], "deletion": deleted})
+        selection_cleared = clear_selected_site_if_matches(run["site_id"])
+        print_json({
+            "run_file": str(target), "site_id": run["site_id"],
+            "deletion": deleted, "selection_cleared": selection_cleared,
+        })
         return
     if args.action == "test-release-matrix":
         if not args.confirm:
@@ -2929,6 +2948,7 @@ def main():
                     "resource_version": result_resource_version(current),
                 })
                 update_test_run(target, run, "deletion-requested")
+                clear_selected_site_if_matches(site_id)
         except BaseException as error:
             run["failure_type"] = type(error).__name__
             update_test_run(target, run, "failed")

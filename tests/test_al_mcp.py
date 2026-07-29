@@ -554,12 +554,30 @@ class SiteClientTest(unittest.TestCase):
             current = {"structuredContent": {"id": "site-test", "uid": "uid-test", "resource_version": "77"}}
             with mock.patch("sys.argv", ["al_mcp.py", "cleanup-test-run", str(target), "--confirm"]), mock.patch.object(
                 al_site, "call_tool", side_effect=[current, {"structuredContent": {"deleted": True}}]
-            ) as call, mock.patch.object(al_site, "print_json"):
+            ) as call, mock.patch.object(
+                al_site, "clear_selected_site_if_matches", return_value=True
+            ) as clear_selection, mock.patch.object(al_site, "print_json"):
                 al_site.main()
             self.assertEqual(
                 mock.call("DeleteSite", {"site_id": "site-test", "confirm": True, "expected_uid": "uid-test", "resource_version": "77"}),
                 call.call_args_list[1],
             )
+            clear_selection.assert_called_once_with("site-test")
+
+    def test_cleanup_uid_mismatch_does_not_clear_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target, _ = al_site.new_test_run(
+                "site-test", "uid-test", "local", pathlib.Path(directory) / "run.json",
+                "44444444-4444-4444-4444-444444444444",
+            )
+            current = {"structuredContent": {"id": "site-test", "uid": "replacement-uid", "resource_version": "88"}}
+            with mock.patch("sys.argv", ["al_mcp.py", "cleanup-test-run", str(target), "--confirm"]), mock.patch.object(
+                al_site, "call_tool", return_value=current
+            ) as call, mock.patch.object(al_site, "clear_selected_site_if_matches") as clear_selection:
+                with self.assertRaisesRegex(SystemExit, "does not match"):
+                    al_site.main()
+            call.assert_called_once_with("GetSite", {"site_id": "site-test"})
+            clear_selection.assert_not_called()
 
     def test_wait_version_uses_cursor_without_restarting_work(self):
         responses = [
@@ -741,6 +759,35 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual({"archived": True}, result)
         self.assertNotIn("site_id", state)
         self.assertEqual("conversation-1", state["conversation_id"])
+
+    def test_cleanup_clears_only_matching_selected_site_and_related_ids(self):
+        tests = [
+            {
+                "name": "matching selection",
+                "state": {"site_id": "site-1", "version_id": "version-1", "deployment_id": "deployment-1"},
+                "site_id": "site-1",
+                "expected": True,
+                "remaining": {},
+            },
+            {
+                "name": "different selection",
+                "state": {"site_id": "site-2", "version_id": "version-2", "deployment_id": "deployment-2"},
+                "site_id": "site-1",
+                "expected": False,
+                "remaining": {"site_id": "site-2", "version_id": "version-2", "deployment_id": "deployment-2"},
+            },
+        ]
+        for test in tests:
+            with self.subTest(test["name"]):
+                state = dict(test["state"])
+
+                def update(mutator):
+                    return mutator(state)
+
+                with mock.patch.object(al_site, "update_state", side_effect=update):
+                    cleared = al_site.clear_selected_site_if_matches(test["site_id"])
+                self.assertEqual(test["expected"], cleared)
+                self.assertEqual(test["remaining"], state)
 
     def test_resume_forwards_explicit_timeout_extension_with_current_preconditions(self):
         status = {"structuredContent": {
