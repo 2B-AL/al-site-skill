@@ -2247,7 +2247,13 @@ def wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds=5
             last = snapshot
         candidate = snapshot.get("candidate")
         traffic = snapshot.get("traffic") if isinstance(snapshot.get("traffic"), dict) else {}
-        if candidate_only and isinstance(candidate, dict) and candidate.get("revisionName") and candidate.get("upstream") and traffic.get("routingRevision"):
+        if (
+            candidate_only
+            and isinstance(candidate, dict)
+            and candidate.get("revisionName")
+            and traffic.get("routingRevision")
+            and traffic.get("projectedAt")
+        ):
             return result, False
         phase = str(snapshot.get("phase") or "").lower()
         state = str(snapshot.get("state") or "")
@@ -2306,7 +2312,20 @@ def finish_release(args, site_id, plan, deployment, timeout_seconds, interval_se
     if getattr(args, "wait_candidate", False):
         status, paused = wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds, candidate_only=True)
         output["release_status"] = status
-        output["candidate_smoke"] = verify_candidate_lane(args, site_id, deployment_id)
+        status_payload = structured_content(status)
+        if str(status_payload.get("phase") or "").lower() == "ready":
+            # A very short Canary can finish between two status reads. It is
+            # no longer possible to prove the candidate lane after promotion,
+            # so report the elapsed window and validate the final public Site
+            # instead of falsely claiming that a stable response was candidate.
+            output["candidate_smoke"] = {
+                "verified": False,
+                "skipped": True,
+                "reason": "candidate window elapsed before validation",
+            }
+            output["public_smoke"] = smoke_public_deployment(status, site_id)
+        else:
+            output["candidate_smoke"] = verify_candidate_lane(args, site_id, deployment_id)
         output["paused"] = paused
     elif getattr(args, "wait", False) or force_wait:
         status, paused = wait_for_release(site_id, deployment_id, timeout_seconds, interval_seconds)

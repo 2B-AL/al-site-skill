@@ -692,13 +692,16 @@ class SiteClientTest(unittest.TestCase):
     def test_wait_candidate_requires_published_routing_revision(self):
         unpublished = {"structuredContent": {
             "phase": "Canary", "state": "Canary",
-            "candidate": {"revisionName": "candidate-1", "upstream": "http://candidate"},
+            "candidate": {"revisionName": "candidate-1"},
             "traffic": {"candidatePercent": 0, "routingEpoch": 7},
         }}
         published = {"structuredContent": {
             "phase": "Canary", "state": "Canary",
-            "candidate": {"revisionName": "candidate-1", "upstream": "http://candidate"},
-            "traffic": {"candidatePercent": 0, "routingEpoch": 7, "routingRevision": "projection-1"},
+            "candidate": {"revisionName": "candidate-1"},
+            "traffic": {
+                "candidatePercent": 0, "routingEpoch": 7,
+                "routingRevision": "projection-1", "projectedAt": "2026-07-29T12:00:00Z",
+            },
         }}
         with mock.patch.object(al_site, "available_tool_names", return_value={"GetSiteReleaseStatus"}), mock.patch.object(
             al_site, "call_tool", side_effect=[unpublished, published]
@@ -707,6 +710,37 @@ class SiteClientTest(unittest.TestCase):
         self.assertFalse(paused)
         self.assertIs(result, published)
         self.assertEqual(2, call.call_count)
+
+    def test_wait_candidate_fast_terminal_release_does_not_smoke_stable_as_candidate(self):
+        args = mock.Mock(wait_candidate=True, wait=False)
+        deployment = {"_meta": {"deployment_id": "deployment-1"}}
+        ready = {"structuredContent": {"phase": "Ready", "terminal": True}}
+        public = {"status": 200, "target": "stable"}
+        with mock.patch.object(al_site, "wait_for_release", return_value=(ready, False)), mock.patch.object(
+            al_site, "verify_candidate_lane"
+        ) as candidate_smoke, mock.patch.object(
+            al_site, "smoke_public_deployment", return_value=public
+        ) as public_smoke:
+            result = al_site.finish_release(args, "site-1", {}, deployment, 30, 1)
+        candidate_smoke.assert_not_called()
+        public_smoke.assert_called_once_with(ready, "site-1")
+        self.assertTrue(result["candidate_smoke"]["skipped"])
+        self.assertFalse(result["candidate_smoke"]["verified"])
+        self.assertEqual(public, result["public_smoke"])
+
+    def test_archive_clears_cached_site_only_after_gateway_success(self):
+        state = {"site_id": "site-1", "conversation_id": "conversation-1"}
+
+        def update(mutator):
+            mutator(state)
+
+        with mock.patch.object(al_site, "post_gateway_json", return_value={"archived": True}), mock.patch.object(
+            al_site, "update_state", side_effect=update
+        ):
+            result = al_site.archive_conversation_site()
+        self.assertEqual({"archived": True}, result)
+        self.assertNotIn("site_id", state)
+        self.assertEqual("conversation-1", state["conversation_id"])
 
     def test_resume_forwards_explicit_timeout_extension_with_current_preconditions(self):
         status = {"structuredContent": {
