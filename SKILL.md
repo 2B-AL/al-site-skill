@@ -19,6 +19,8 @@ python3 scripts/al_mcp.py call GetSitePlatformCapabilities
 
 Treat `tools/list`, the online schema, and capability `supported/configured/ready` fields as authoritative. A feature implemented in source but reported unready by the environment is unavailable.
 
+For a non-mutating health check, use `python3 scripts/al_mcp.py doctor`. It never starts login, creates a conversation, issues a Grafana link, or calls a mutating Site tool; missing cached authentication or conversation state is reported instead.
+
 The default dev endpoint is the Site MCP Gateway, not the Site Access Gateway or an Ingress placeholder host. Override other environments with `configure --gateway-url` or `AL_SITE_MCP_GATEWAY_URL`.
 
 ## Select the resource explicitly
@@ -128,7 +130,7 @@ python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-br
 python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
 
-`observe` first asks Site MCP to re-authorize the selected Site and then returns a short-lived AL OAuth protected Grafana link scoped to that immutable Site UID. Never construct Grafana URLs or tenant query parameters manually. Dashboard-link failure is diagnostic only and must not change build, release, rollback, or scaling state.
+`observe` first asks Site MCP to re-authorize the selected Site and then issues a short-lived AL OAuth protected Grafana link scoped to that immutable Site UID. This does not mutate the Site, but it is an authorization-artifact issuance side effect. Never construct Grafana URLs or tenant query parameters manually. Dashboard-link failure is diagnostic only and must not change build, release, rollback, or scaling state.
 
 `GetSiteScaling`, `GetSiteMetrics`, and `GetSiteUsage` are read-only and may consume one bounded MCP retry when the Manager explicitly reports a retryable observability 429/502/503/504. Workflow waits continue within their existing deadline after that budget is exhausted. Never extend this behavior to release, promotion, rollback, scaling apply, or any other mutating tool, and never turn unavailable metrics into a passing gate.
 

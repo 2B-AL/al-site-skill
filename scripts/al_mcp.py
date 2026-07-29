@@ -48,6 +48,16 @@ SITE_TOOLS = (
     "ArchiveConversationSite", "DeleteSite",
 )
 
+SITE_READ_ONLY_TOOLS = {
+    "GetSitePlatformCapabilities", "GetCurrentSite", "GetSite", "ListSites",
+    "PlanSiteVersion", "GetSiteVersion", "WatchSiteVersion", "GetSiteVersionLogs",
+    "ListSiteVersions", "CompareSiteVersions", "PlanSiteDeployment", "GetSiteDeployment",
+    "GetSiteReleaseStatus", "WatchSiteDeployment", "ListSiteDeployments", "PlanSiteScaling",
+    "GetSiteScaling", "GetSiteAccessPolicy", "ListSiteDomains", "GetSiteLogs", "GetSiteEvents",
+    "GetSiteMetrics", "GetSiteUsage",
+}
+SITE_CREDENTIAL_ISSUING_TOOLS = {"GetSiteObservabilityLink", "CreateSiteLaneSession"}
+
 MAX_SOURCE_FILES = 100000
 MAX_SOURCE_BYTES = 2 << 30
 MAX_SOURCE_FILE_BYTES = 256 << 20
@@ -264,6 +274,13 @@ def ensure_conversation_id():
     return update_state(ensure)
 
 
+def existing_conversation_id():
+    value = os.environ.get("AL_SITE_CONVERSATION_ID", "").strip()
+    if value:
+        return value
+    return str(load_state().get("conversation_id") or "").strip()
+
+
 def set_new_conversation_id():
     def reset(state):
         state["conversation_id"] = str(uuid.uuid4())
@@ -357,11 +374,15 @@ def logout():
     update_state(clear_auth)
 
 
-def headers():
+def headers(readonly=False):
+    token = cached_token() if readonly else ensure_token()
+    conversation_id = existing_conversation_id() if readonly else ensure_conversation_id()
+    if readonly and (not token or not conversation_id):
+        raise SystemExit("read-only diagnostics require an existing login and conversation; run login and conversation explicitly")
     result = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + ensure_token(),
-        "X-AL-Conversation-ID": ensure_conversation_id(),
+        "Authorization": "Bearer " + token,
+        "X-AL-Conversation-ID": conversation_id,
     }
     tool_call_id = os.environ.get("AL_SITE_TOOL_CALL_ID", "").strip()
     if tool_call_id:
@@ -380,7 +401,7 @@ def request_timeout():
     return max(value, 1)
 
 
-def rpc(method, params=None, request_id=None):
+def rpc(method, params=None, request_id=None, readonly=False):
     payload = {
         "jsonrpc": "2.0",
         "id": request_id or str(uuid.uuid4()),
@@ -390,7 +411,7 @@ def rpc(method, params=None, request_id=None):
     request = urllib.request.Request(
         mcp_url(),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers(),
+        headers=headers(readonly=readonly),
         method="POST",
     )
     try:
@@ -925,9 +946,22 @@ def call_tool(name, arguments):
 
 
 def call_tool_result(name, arguments):
+    warn_tool_effect(name)
     result = rpc("tools/call", {"name": name, "arguments": arguments})
     cache_resource_ids(result)
     return result
+
+
+def warn_tool_effect(name):
+    if name in SITE_READ_ONLY_TOOLS:
+        return
+    if name in SITE_CREDENTIAL_ISSUING_TOOLS:
+        print(
+            f"notice: {name} does not mutate Site resources, but it issues a short-lived authorization artifact",
+            file=sys.stderr,
+        )
+        return
+    print(f"notice: {name} may mutate Site resources or conversation selection", file=sys.stderr)
 
 
 def retryable_observability_error(result):
@@ -962,6 +996,83 @@ def structured_content(result):
     if isinstance(result, dict) and isinstance(result.get("structuredContent"), dict):
         return result["structuredContent"]
     return {}
+
+
+def existing_site_id():
+    value = os.environ.get("AL_SITE_ID", "").strip()
+    if value:
+        return value
+    return str(load_state().get("site_id") or "").strip()
+
+
+def doctor_report():
+    report = {
+        "gateway_url": mcp_url(),
+        "read_only": True,
+        "checks": [],
+        "side_effects": {
+            "observability_link": "issues a short-lived authorization link and is not called by doctor",
+            "plans_and_queries": "read-only",
+            "release_and_resource_tools": "mutating",
+        },
+    }
+
+    def record(name, ok, detail=""):
+        item = {"name": name, "ok": bool(ok)}
+        if detail != "":
+            item["detail"] = detail
+        report["checks"].append(item)
+
+    token = cached_token()
+    conversation_id = existing_conversation_id()
+    record("cached_auth", bool(token), "present" if token else "missing; doctor did not start login")
+    record("existing_conversation", bool(conversation_id), "present" if conversation_id else "missing; doctor did not create one")
+    if not token or not conversation_id:
+        report["ok"] = False
+        return report
+    try:
+        listed_tools = rpc("tools/list", readonly=True)
+        tools = {
+            str(item.get("name") or "")
+            for item in listed_tools.get("tools", [])
+            if isinstance(item, dict)
+        }
+        required = {"GetSitePlatformCapabilities", "ListSites", "GetSite", "GetSiteMetrics", "GetSiteUsage", "GetSiteLogs"}
+        missing = sorted(required.difference(tools))
+        record("tool_discovery", not missing, {"count": len(tools), "missing": missing})
+    except (SystemExit, OSError, ValueError, json.JSONDecodeError) as error:
+        record("tool_discovery", False, str(error))
+        report["ok"] = False
+        return report
+    try:
+        capabilities = rpc("tools/call", {"name": "GetSitePlatformCapabilities", "arguments": {}}, readonly=True)
+        payload = structured_content(capabilities)
+        record("platform_capabilities", bool(payload), {"api_version": payload.get("apiVersion", "")})
+    except (SystemExit, OSError, ValueError, json.JSONDecodeError) as error:
+        record("platform_capabilities", False, str(error))
+    try:
+        result = rpc("tools/call", {
+            "name": "ListSites", "arguments": {"relation": "accessible", "limit": 100},
+        }, readonly=True)
+        items, next_token = site_page(result)
+        record("accessible_sites", True, {"count": len(items), "truncated": bool(next_token)})
+    except (SystemExit, OSError, ValueError, json.JSONDecodeError) as error:
+        record("accessible_sites", False, str(error))
+    selected = existing_site_id()
+    report["selected_site"] = selected or None
+    if selected:
+        try:
+            result = rpc("tools/call", {
+                "name": "GetSite", "arguments": {"site_id": selected, "relation": "accessible"},
+            }, readonly=True)
+            record("selected_site_access", not bool(result.get("isError")), {"site_id": selected})
+        except (SystemExit, OSError, ValueError, json.JSONDecodeError) as error:
+            record("selected_site_access", False, str(error))
+    else:
+        record("selected_site_access", True, "none selected")
+    report["observability_link_available"] = "GetSiteObservabilityLink" in tools
+    report["ok"] = all(item["ok"] for item in report["checks"])
+    return report
 
 
 def site_page(result):
@@ -2477,6 +2588,7 @@ def build_parser():
     configure = sub.add_parser("configure")
     configure.add_argument("--gateway-url", required=True)
     sub.add_parser("config")
+    sub.add_parser("doctor", help="Run read-only auth, capability, and resource diagnostics without login or state changes")
     sub.add_parser("login")
     sub.add_parser("login-url")
     sub.add_parser("logout")
@@ -2713,6 +2825,9 @@ def main():
             "has_valid_token": bool(cached_token()),
             "state_file": str(STATE_FILE),
         })
+        return
+    if args.action == "doctor":
+        print_json(doctor_report())
         return
     if args.action == "login":
         login()

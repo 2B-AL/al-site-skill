@@ -19,6 +19,50 @@ SPEC.loader.exec_module(al_site)
 
 class SiteClientTest(unittest.TestCase):
 
+    def test_doctor_is_read_only_and_does_not_issue_links(self):
+        tools = {"tools": [
+            {"name": "GetSitePlatformCapabilities"}, {"name": "ListSites"}, {"name": "GetSite"},
+            {"name": "GetSiteMetrics"}, {"name": "GetSiteUsage"}, {"name": "GetSiteLogs"},
+            {"name": "GetSiteObservabilityLink"},
+        ]}
+        capabilities = {"structuredContent": {"apiVersion": "2026-07-25"}}
+        sites = {"structuredContent": {"items": [{"id": "site-1"}]}}
+        selected = {"structuredContent": {"id": "site-1", "uid": "site-uid"}}
+        with mock.patch.object(al_site, "cached_token", return_value="cached"), mock.patch.object(
+            al_site, "existing_conversation_id", return_value="conversation-1"
+        ), mock.patch.object(al_site, "existing_site_id", return_value="site-1"), mock.patch.object(
+            al_site, "rpc", side_effect=[tools, capabilities, sites, selected]
+        ) as rpc:
+            report = al_site.doctor_report()
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["read_only"])
+        self.assertTrue(report["observability_link_available"])
+        self.assertEqual([
+            mock.call("tools/list", readonly=True),
+            mock.call("tools/call", {"name": "GetSitePlatformCapabilities", "arguments": {}}, readonly=True),
+            mock.call("tools/call", {"name": "ListSites", "arguments": {"relation": "accessible", "limit": 100}}, readonly=True),
+            mock.call("tools/call", {"name": "GetSite", "arguments": {"site_id": "site-1", "relation": "accessible"}}, readonly=True),
+        ], rpc.call_args_list)
+
+    def test_doctor_does_not_login_or_create_conversation(self):
+        with mock.patch.object(al_site, "cached_token", return_value=""), mock.patch.object(
+            al_site, "existing_conversation_id", return_value=""
+        ), mock.patch.object(al_site, "rpc") as rpc:
+            report = al_site.doctor_report()
+        self.assertFalse(report["ok"])
+        rpc.assert_not_called()
+
+    def test_tool_effect_classification(self):
+        with mock.patch("sys.stderr") as stderr:
+            al_site.warn_tool_effect("GetSite")
+            self.assertFalse(stderr.write.called)
+        with mock.patch("sys.stderr") as stderr:
+            al_site.warn_tool_effect("GetSiteObservabilityLink")
+            self.assertIn("issues a short-lived authorization artifact", "".join(call.args[0] for call in stderr.write.call_args_list))
+        with mock.patch("sys.stderr") as stderr:
+            al_site.warn_tool_effect("DeploySiteVersion")
+            self.assertIn("may mutate Site resources", "".join(call.args[0] for call in stderr.write.call_args_list))
+
     def test_state_updates_are_atomic_under_concurrency(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = pathlib.Path(directory)
