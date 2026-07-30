@@ -289,19 +289,35 @@ def set_new_conversation_id():
     return update_state(reset)
 
 
-def cache_resource_ids(result):
+def cache_resource_ids(tool_name, result):
     if not isinstance(result, dict):
         return
     meta = result.get("_meta")
     if not isinstance(meta, dict):
         return
+    allowed = {
+        "CreateSite": ("site_id",),
+        "SelectSite": ("site_id",),
+        "SaveSiteVersion": ("version_id",),
+        "DeploySiteVersion": ("deployment_id",),
+        "RollbackSite": ("deployment_id",),
+    }.get(str(tool_name or ""), ())
     values = {}
-    for key in ("site_id", "version_id", "deployment_id"):
+    for key in allowed:
         value = str(meta.get(key) or "").strip()
         if value:
             values[key] = value
-    if values:
-        update_state(lambda state: state.update(values))
+    if not values:
+        return
+
+    def cache(state):
+        next_site = values.get("site_id")
+        if next_site and str(state.get("site_id") or "").strip() != next_site:
+            state.pop("version_id", None)
+            state.pop("deployment_id", None)
+        state.update(values)
+
+    update_state(cache)
 
 
 class LoginCallbackHandler(http.server.BaseHTTPRequestHandler):
@@ -923,8 +939,19 @@ def save_local_source(path, site_id, build_json="{}", runtime_json="{}"):
 
 
 def archive_conversation_site():
-    result = post_gateway_json("/internal/conversation-site/archive", {})
-    update_state(lambda state: state.pop("site_id", None))
+    current = call_tool_result("GetCurrentSite", {})
+    if isinstance(current, dict) and current.get("isError"):
+        meta = current.get("_meta") if isinstance(current.get("_meta"), dict) else {}
+        if meta.get("upstream_status") == 404 or meta.get("status_code") == 404:
+            clear_selected_site_if_matches(existing_site_id())
+            return {"conversation_binding_action": "already-archived"}
+        raise SystemExit(json.dumps(bounded_tool_error(current), ensure_ascii=False, sort_keys=True))
+    site_id, resource_version = current_site_selection(current)
+    result = post_gateway_json("/internal/conversation-site/archive", {
+        "expected_site_id": site_id,
+        "resource_version": resource_version,
+    })
+    clear_selected_site_if_matches(site_id)
     return result
 
 
@@ -941,6 +968,38 @@ def clear_selected_site_if_matches(site_id):
         return True
 
     return bool(update_state(clear))
+
+
+def current_site_selection(result):
+    structured = structured_content(result)
+    spec = structured.get("spec") if isinstance(structured.get("spec"), dict) else {}
+    site_ref = spec.get("siteRef") if isinstance(spec.get("siteRef"), dict) else {}
+    site_id = str(site_ref.get("name") or "").strip()
+    metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
+    resource_version = str(metadata.get("resourceVersion") or "").strip()
+    if not site_id or not resource_version:
+        raise SystemExit("current Site selection is missing site identity or resource_version")
+    return site_id, resource_version
+
+
+def clear_server_selection_if_matches(site_id):
+    expected = str(site_id or "").strip()
+    if not expected:
+        return False
+    current = call_tool_result("GetCurrentSite", {})
+    if isinstance(current, dict) and current.get("isError"):
+        meta = current.get("_meta") if isinstance(current.get("_meta"), dict) else {}
+        if meta.get("upstream_status") == 404 or meta.get("status_code") == 404:
+            return False
+        raise SystemExit(json.dumps(bounded_tool_error(current), ensure_ascii=False, sort_keys=True))
+    selected, resource_version = current_site_selection(current)
+    if selected != expected:
+        return False
+    call_tool("ArchiveConversationSite", {
+        "expected_site_id": expected,
+        "resource_version": resource_version,
+    })
+    return True
 
 
 def result_text(result):
@@ -963,7 +1022,7 @@ def call_tool(name, arguments):
 def call_tool_result(name, arguments):
     warn_tool_effect(name)
     result = rpc("tools/call", {"name": name, "arguments": arguments})
-    cache_resource_ids(result)
+    cache_resource_ids(name, result)
     return result
 
 
@@ -1515,7 +1574,19 @@ def load_source_handoff(value):
     if not raw:
         raise SystemExit("--handoff requires a descriptor JSON object or @file.json")
     if raw.startswith("@"):
-        raw = pathlib.Path(raw[1:]).read_text(encoding="utf-8")
+        try:
+            raw = pathlib.Path(raw[1:]).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise SystemExit(
+                "Sandbox source handoff file was not found or was already consumed; "
+                "request a fresh handoff from al-sandbox"
+            )
+        except PermissionError:
+            raise SystemExit("Sandbox source handoff file is not readable; check its owner and mode")
+        except UnicodeError:
+            raise SystemExit("Sandbox source handoff file must contain UTF-8 JSON")
+        except OSError:
+            raise SystemExit("Sandbox source handoff file could not be read")
     try:
         descriptor = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -2924,6 +2995,7 @@ def main():
         resource_version = result_resource_version(current)
         if not resource_version:
             raise SystemExit("refusing test cleanup: GetSite did not return the latest resource_version")
+        server_selection_cleared = clear_server_selection_if_matches(run["site_id"])
         deleted = call_tool("DeleteSite", {
             "site_id": run["site_id"],
             "confirm": True,
@@ -2931,10 +3003,12 @@ def main():
             "resource_version": resource_version,
         })
         update_test_run(target, run, "deletion-requested")
-        selection_cleared = clear_selected_site_if_matches(run["site_id"])
+        local_selection_cleared = clear_selected_site_if_matches(run["site_id"])
         print_json({
             "run_file": str(target), "site_id": run["site_id"],
-            "deletion": deleted, "selection_cleared": selection_cleared,
+            "deletion": deleted,
+            "local_selection_cleared": local_selection_cleared,
+            "server_selection_cleared": server_selection_cleared,
         })
         return
     if args.action == "test-release-matrix":
@@ -2957,12 +3031,17 @@ def main():
                 current = call_tool("GetSite", {"site_id": site_id})
                 if result_uid(current) != run["site_uid"]:
                     raise SystemExit("refusing matrix cleanup: current Site UID differs from the test manifest")
+                server_selection_cleared = clear_server_selection_if_matches(site_id)
                 cleanup = call_tool("DeleteSite", {
                     "site_id": site_id, "confirm": True, "expected_uid": run["site_uid"],
                     "resource_version": result_resource_version(current),
                 })
                 update_test_run(target, run, "deletion-requested")
-                clear_selected_site_if_matches(site_id)
+                cleanup = {
+                    "deletion": cleanup,
+                    "local_selection_cleared": clear_selected_site_if_matches(site_id),
+                    "server_selection_cleared": server_selection_cleared,
+                }
         except BaseException as error:
             run["failure_type"] = type(error).__name__
             update_test_run(target, run, "failed")

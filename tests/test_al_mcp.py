@@ -396,6 +396,24 @@ class SiteClientTest(unittest.TestCase):
             al_site.remove_consumed_handoff_file("@" + str(descriptor))
             self.assertFalse(descriptor.exists())
 
+    def test_missing_consumed_handoff_file_returns_bounded_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory) / "consumed.json"
+            with self.assertRaisesRegex(SystemExit, "not found or was already consumed"):
+                al_site.load_source_handoff("@" + str(missing))
+
+    def test_unreadable_handoff_file_returns_bounded_error(self):
+        with mock.patch.object(pathlib.Path, "read_text", side_effect=PermissionError):
+            with self.assertRaisesRegex(SystemExit, "not readable"):
+                al_site.load_source_handoff("@handoff.json")
+
+    def test_non_utf8_handoff_file_returns_bounded_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            invalid = pathlib.Path(directory) / "handoff.json"
+            invalid.write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(SystemExit, "UTF-8 JSON"):
+                al_site.load_source_handoff("@" + str(invalid))
+
     def test_public_test_site_requires_confirmation_before_mutation(self):
         capabilities = {"routing": {"recommendedCreate": {"audience": "public", "publicPublishing": True}}}
         with mock.patch.object(al_site, "platform_capabilities", return_value=capabilities), mock.patch.object(
@@ -591,6 +609,8 @@ class SiteClientTest(unittest.TestCase):
             with mock.patch("sys.argv", ["al_mcp.py", "cleanup-test-run", str(target), "--confirm"]), mock.patch.object(
                 al_site, "call_tool", side_effect=[current, {"structuredContent": {"deleted": True}}]
             ) as call, mock.patch.object(
+                al_site, "clear_server_selection_if_matches", return_value=True
+            ) as clear_server_selection, mock.patch.object(
                 al_site, "clear_selected_site_if_matches", return_value=True
             ) as clear_selection, mock.patch.object(al_site, "print_json"):
                 al_site.main()
@@ -598,6 +618,7 @@ class SiteClientTest(unittest.TestCase):
                 mock.call("DeleteSite", {"site_id": "site-test", "confirm": True, "expected_uid": "uid-test", "resource_version": "77"}),
                 call.call_args_list[1],
             )
+            clear_server_selection.assert_called_once_with("site-test")
             clear_selection.assert_called_once_with("site-test")
 
     def test_cleanup_uid_mismatch_does_not_clear_selection(self):
@@ -788,13 +809,37 @@ class SiteClientTest(unittest.TestCase):
         def update(mutator):
             mutator(state)
 
-        with mock.patch.object(al_site, "post_gateway_json", return_value={"archived": True}), mock.patch.object(
+        current = {"structuredContent": {"metadata": {"resourceVersion": "42"}, "spec": {"siteRef": {"name": "site-1"}}}}
+        with mock.patch.object(al_site, "call_tool_result", return_value=current), mock.patch.object(
+            al_site, "post_gateway_json", return_value={"archived": True}
+        ) as archive, mock.patch.object(
             al_site, "update_state", side_effect=update
         ):
             result = al_site.archive_conversation_site()
         self.assertEqual({"archived": True}, result)
         self.assertNotIn("site_id", state)
         self.assertEqual("conversation-1", state["conversation_id"])
+        archive.assert_called_once_with("/internal/conversation-site/archive", {
+            "expected_site_id": "site-1", "resource_version": "42",
+        })
+
+    def test_server_selection_clear_is_compare_and_swap(self):
+        current = {"structuredContent": {"metadata": {"resourceVersion": "42"}, "spec": {"siteRef": {"name": "site-1"}}}}
+        with mock.patch.object(al_site, "call_tool_result", return_value=current), mock.patch.object(
+            al_site, "call_tool", return_value={"structuredContent": {"status": "Archived"}}
+        ) as archive:
+            self.assertTrue(al_site.clear_server_selection_if_matches("site-1"))
+        archive.assert_called_once_with("ArchiveConversationSite", {
+            "expected_site_id": "site-1", "resource_version": "42",
+        })
+
+    def test_server_selection_clear_preserves_new_selection(self):
+        current = {"structuredContent": {"metadata": {"resourceVersion": "43"}, "spec": {"siteRef": {"name": "site-new"}}}}
+        with mock.patch.object(al_site, "call_tool_result", return_value=current), mock.patch.object(
+            al_site, "call_tool"
+        ) as archive:
+            self.assertFalse(al_site.clear_server_selection_if_matches("site-old"))
+        archive.assert_not_called()
 
     def test_cleanup_clears_only_matching_selected_site_and_related_ids(self):
         tests = [
@@ -824,6 +869,38 @@ class SiteClientTest(unittest.TestCase):
                     cleared = al_site.clear_selected_site_if_matches(test["site_id"])
                 self.assertEqual(test["expected"], cleared)
                 self.assertEqual(test["remaining"], state)
+
+    def test_only_explicit_mutations_update_cached_resource_selection(self):
+        cases = [
+            ("GetSite", {"site_id": "read-site"}, {}),
+            ("ListSites", {"site_id": "listed-site"}, {}),
+            ("GetSiteObservabilityLink", {"site_id": "observed-site"}, {}),
+            ("CreateSite", {"site_id": "created-site"}, {"site_id": "created-site"}),
+            ("SelectSite", {"site_id": "selected-site"}, {"site_id": "selected-site"}),
+            ("SaveSiteVersion", {"site_id": "ignored-site", "version_id": "version-1"}, {"version_id": "version-1"}),
+            ("DeploySiteVersion", {"site_id": "ignored-site", "deployment_id": "deployment-1"}, {"deployment_id": "deployment-1"}),
+            ("RollbackSite", {"deployment_id": "rollback-1"}, {"deployment_id": "rollback-1"}),
+        ]
+        for tool_name, meta, expected in cases:
+            with self.subTest(tool_name):
+                state = {}
+
+                def update(mutator):
+                    return mutator(state)
+
+                with mock.patch.object(al_site, "update_state", side_effect=update):
+                    al_site.cache_resource_ids(tool_name, {"_meta": meta})
+                self.assertEqual(expected, state)
+
+    def test_selecting_a_different_site_clears_cached_children(self):
+        state = {"site_id": "site-old", "version_id": "version-old", "deployment_id": "deployment-old"}
+
+        def update(mutator):
+            return mutator(state)
+
+        with mock.patch.object(al_site, "update_state", side_effect=update):
+            al_site.cache_resource_ids("SelectSite", {"_meta": {"site_id": "site-new"}})
+        self.assertEqual({"site_id": "site-new"}, state)
 
     def test_resume_forwards_explicit_timeout_extension_with_current_preconditions(self):
         status = {"structuredContent": {
