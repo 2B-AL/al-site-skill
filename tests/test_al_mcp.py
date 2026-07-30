@@ -445,6 +445,28 @@ class SiteClientTest(unittest.TestCase):
         self.assertEqual("signed-cookie", blue_green["lanes"][0]["mode"])
         self.assertEqual([10, 50, 100], [step["percent"] for step in canary["steps"]])
 
+    def test_canary_duration_requires_an_explicit_unit_before_mutation(self):
+        parser = al_site.build_parser()
+        args = parser.parse_args([
+            "release", "version-1", "--canary", "100", "--step-duration", "5",
+        ])
+        with self.assertRaisesRegex(SystemExit, "explicit unit"):
+            al_site.release_strategy_from_args(args)
+
+    def test_canary_duration_accepts_composite_go_durations_and_zero_observation(self):
+        parser = al_site.build_parser()
+        for duration in ("5s", "1m30s", "0s"):
+            args = parser.parse_args([
+                "release", "version-1", "--canary", "100", "--step-duration", duration,
+            ])
+            strategy = al_site.release_strategy_from_args(args)
+            self.assertEqual(duration, strategy["steps"][0]["duration"])
+        args = parser.parse_args([
+            "release", "version-1", "--canary", "100", "--step-timeout", "0s",
+        ])
+        with self.assertRaisesRegex(SystemExit, "must be positive"):
+            al_site.release_strategy_from_args(args)
+
     def test_release_matrix_preflight_validates_source_before_mutation(self):
         parser = al_site.build_parser()
         args = parser.parse_args(["test-release-matrix", "/missing/project", "--confirm"])
@@ -469,6 +491,69 @@ class SiteClientTest(unittest.TestCase):
             with mock.patch.object(al_site, "require_tools"):
                 al_site.preflight_release_matrix(args)
             self.assertTrue(json.loads(args.build)["path_prefix_aware"])
+
+    def test_release_matrix_rejects_invalid_duration_before_source_packaging(self):
+        parser = al_site.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "Dockerfile").write_text("FROM scratch\nUSER 65532\n", encoding="utf-8")
+            args = parser.parse_args([
+                "test-release-matrix", directory, "--confirm", "--confirm-path-prefix-aware",
+                "--step-duration", "5",
+            ])
+            with mock.patch.object(al_site, "require_tools"), mock.patch.object(
+                al_site, "create_source_manifest"
+            ) as package, self.assertRaisesRegex(SystemExit, "explicit unit"):
+                al_site.preflight_release_matrix(args)
+            package.assert_not_called()
+
+    def test_current_handoff_preflight_requires_prefix_contract_without_consuming_file(self):
+        parser = al_site.build_parser()
+        descriptor = {
+            "schema_version": "sandbox-site-handoff/v1",
+            "source_export_grant": "g" * 64,
+            "sandbox_conversation_id": "conversation",
+            "source_root": "/workspace/project",
+            "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)).isoformat(),
+            "source_manifest": {"digest": "sha256:" + "a" * 64, "files": ["Dockerfile"]},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            handoff = pathlib.Path(directory, "handoff.json")
+            handoff.write_text(json.dumps(descriptor), encoding="utf-8")
+            args = parser.parse_args(["test-deploy-current", "--handoff", "@" + str(handoff)])
+            with mock.patch.object(al_site, "require_tools"), self.assertRaisesRegex(
+                SystemExit, "confirm-path-prefix-aware"
+            ):
+                al_site.preflight_test_deploy_current(args)
+            self.assertTrue(handoff.exists())
+
+    def test_current_handoff_preflight_applies_explicit_prefix_contract(self):
+        parser = al_site.build_parser()
+        descriptor = {
+            "schema_version": "sandbox-site-handoff/v1",
+            "source_export_grant": "g" * 64,
+            "sandbox_conversation_id": "conversation",
+            "source_root": "/workspace/project",
+            "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=10)).isoformat(),
+            "source_manifest": {"digest": "sha256:" + "a" * 64, "files": ["Dockerfile"]},
+        }
+        args = parser.parse_args([
+            "test-deploy-current", "--handoff", json.dumps(descriptor), "--confirm-path-prefix-aware",
+        ])
+        with mock.patch.object(al_site, "require_tools"):
+            al_site.preflight_test_deploy_current(args)
+        self.assertTrue(json.loads(args.build)["path_prefix_aware"])
+
+    def test_current_handoff_preflight_runs_before_test_site_creation(self):
+        with mock.patch("sys.argv", [
+            "al_mcp.py", "test-deploy-current", "--handoff", "@handoff.json",
+        ]), mock.patch.object(
+            al_site, "preflight_test_deploy_current", side_effect=SystemExit("invalid handoff")
+        ), mock.patch.object(al_site, "begin_test_run") as begin, mock.patch.object(
+            al_site, "create_test_site"
+        ) as create, self.assertRaisesRegex(SystemExit, "invalid handoff"):
+            al_site.main()
+        begin.assert_not_called()
+        create.assert_not_called()
 
     def test_call_tool_preserves_structured_error_metadata(self):
         result = {

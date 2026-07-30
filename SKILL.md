@@ -42,7 +42,8 @@ Choose exactly one source path:
 python3 scripts/al_mcp.py save-local . --site-id SITE_ID
 python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID
 python3 scripts/al_mcp.py save-oci IMAGE@sha256:DIGEST --site-id SITE_ID
-python3 scripts/al_mcp.py save-current --handoff @/tmp/al-site-handoff.json --site-id SITE_ID
+python3 scripts/al_mcp.py save-current --handoff @/tmp/al-site-handoff.json --site-id SITE_ID \
+  --confirm-path-prefix-aware
 ```
 
 For a remote dependency-free static Git commit, the client cannot inspect source files. Only when the caller has verified that all assets, navigation, fetches, and service-worker scope work below the Site path prefix, use:
@@ -53,6 +54,8 @@ python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID \
 ```
 
 The flag is an explicit assertion, not a source rewrite. Omit it to fail closed when prefix compatibility is unknown.
+
+The same fail-closed assertion applies to a Sandbox handoff whose Dockerfile or dynamic server cannot be proven prefix-aware from its bounded source manifest. `save-current` and `test-deploy-current` accept `--confirm-path-prefix-aware`; the test command validates the handoff, prefix contract, runtime, and release duration before it creates a dedicated Site, and consumes the handoff only after `SaveSiteVersion` succeeds.
 
 Every strong save command calls `PlanSiteVersion` before upload or CR creation. Keep `build.dockerfile` relative to `build.context`; use a numeric non-root final `USER`. Never export an entire Sandbox when only a project subdirectory is needed. Read [references/local-source.md](references/local-source.md), [references/local-git.md](references/local-git.md), or [references/versions.md](references/versions.md) when the source or version workflow is relevant.
 

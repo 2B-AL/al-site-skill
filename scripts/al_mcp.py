@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import datetime
+from decimal import Decimal, InvalidOperation
 import fnmatch
 import fcntl
 import gzip
@@ -1227,6 +1228,42 @@ def parse_canary_percentages(value):
     return percentages
 
 
+GO_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|s|m|h)")
+GO_DURATION_SECONDS = {
+    "ns": Decimal("0.000000001"),
+    "us": Decimal("0.000001"),
+    "µs": Decimal("0.000001"),
+    "μs": Decimal("0.000001"),
+    "ms": Decimal("0.001"),
+    "s": Decimal(1),
+    "m": Decimal(60),
+    "h": Decimal(3600),
+}
+
+
+def validate_go_duration(value, option, maximum_seconds, allow_zero):
+    raw = str(value or "").strip()
+    position = 0
+    total = Decimal(0)
+    try:
+        for match in GO_DURATION_PART.finditer(raw):
+            if match.start() != position:
+                raise InvalidOperation
+            total += Decimal(match.group(1)) * GO_DURATION_SECONDS[match.group(2)]
+            position = match.end()
+    except InvalidOperation:
+        position = -1
+    if not raw or position != len(raw):
+        raise SystemExit(
+            f"{option} must use a duration with an explicit unit, for example 5s, 5m, or 1m30s"
+        )
+    maximum = Decimal(maximum_seconds)
+    if total > maximum or total < 0 or (not allow_zero and total == 0):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise SystemExit(f"{option} must be {qualifier} and no greater than {maximum_seconds} seconds")
+    return raw
+
+
 def metric_gate_from_args(args):
     mapping = {
         "min_requests": "min_requests",
@@ -1254,13 +1291,19 @@ def release_strategy_from_args(args):
     strategy_type = "canary" if canary else "blue-green" if getattr(args, "blue_green", False) else "immediate"
     strategy = {"type": strategy_type}
     if strategy_type == "canary":
+        step_duration = validate_go_duration(
+            getattr(args, "step_duration", "5m"), "--step-duration", 24 * 60 * 60, True,
+        )
+        step_timeout = validate_go_duration(
+            getattr(args, "step_timeout", "30m"), "--step-timeout", 7 * 24 * 60 * 60, False,
+        )
         gate = metric_gate_from_args(args)
         strategy["steps"] = []
         for percent in parse_canary_percentages(canary):
             step = {
                 "percent": percent,
-                "duration": getattr(args, "step_duration", "5m"),
-                "timeout": getattr(args, "step_timeout", "30m"),
+                "duration": step_duration,
+                "timeout": step_timeout,
                 "failure_action": getattr(args, "failure_action", "rollback"),
             }
             if getattr(args, "manual_approval", False):
@@ -1867,6 +1910,9 @@ def preflight_release_matrix(args):
     if args.cleanup:
         required.extend(["GetSite", "DeleteSite"])
     require_tools(*required)
+    # Validate every release strategy before creating the test Site or building
+    # any immutable version. In particular, reject unitless Go durations here.
+    release_strategy_from_args(release_matrix_args(args, "canary"))
     # Fail before creating the dedicated Site when the local source is unsafe,
     # oversized, or has an invalid build contract. save_local_source repeats
     # this check immediately before packaging to close the TOCTOU window.
@@ -1879,6 +1925,27 @@ def preflight_release_matrix(args):
         )
     args.build = json.dumps(build)
     create_source_manifest(args.path)
+
+
+def preflight_test_deploy_current(args):
+    require_tools(
+        "GetSitePlatformCapabilities", "CreateSite", "PlanSiteVersion", "SaveSiteVersion",
+        "GetSiteVersion", "PlanSiteDeployment", "DeploySiteVersion", "GetSiteReleaseStatus",
+    )
+    # This descriptor load is deliberately non-consuming. It validates grant
+    # scope and lifetime before any Site exists; the save path reloads it to
+    # close the expiry/TOCTOU window and removes it only after SaveSiteVersion.
+    source = load_source_handoff(args.handoff)
+    build = normalized_manifest_build(source.get("source_manifest", {}), args.build)
+    build = apply_path_prefix_assertion(build, args.confirm_path_prefix_aware)
+    if build.get("path_prefix_aware") is not True:
+        raise SystemExit(
+            "test-deploy-current requires an explicit path-prefix-aware source contract before creating the test Site; "
+            "pass --confirm-path-prefix-aware only after verifying the application works below a non-root URL prefix"
+        )
+    load_json_object(args.runtime)
+    release_strategy_from_args(args)
+    args.build = json.dumps(build)
 
 
 def run_release_matrix(args, target, run, site_id):
@@ -2750,6 +2817,10 @@ def build_parser():
 
     save_current = sub.add_parser("save-current")
     save_current.add_argument("--handoff", default="", help="Explicit one-time Sandbox handoff JSON or @file.json")
+    save_current.add_argument(
+        "--confirm-path-prefix-aware", action="store_true",
+        help="Explicitly assert that the Sandbox application works below the Site path prefix",
+    )
     add_save_options(save_current)
     save_git = sub.add_parser("save-git")
     save_git.add_argument("repository")
@@ -2792,6 +2863,10 @@ def build_parser():
     test_current.add_argument("--run-file", default="", help="0600 test run manifest path; defaults below AL_SITE_STATE_DIR")
     test_current.add_argument("--confirm-public", action="store_true")
     test_current.add_argument("--build", default="{}")
+    test_current.add_argument(
+        "--confirm-path-prefix-aware", action="store_true",
+        help="Assert that the Sandbox application works below the Site APIG path prefix before creating the test Site",
+    )
     test_current.add_argument("--runtime", default="{}")
     add_release_options(test_current)
     add_wait_options(test_current, 1800)
@@ -3050,6 +3125,12 @@ def main():
         print_json({"run_file": str(target), "site_id": site_id, "matrix": matrix, "cleanup": cleanup})
         return
     if args.action in {"test-deploy-local", "test-deploy-current"}:
+        if args.action == "test-deploy-current":
+            preflight_test_deploy_current(args)
+        else:
+            # Canary syntax and bounds must fail before a dedicated test Site is
+            # created even when the source itself is local.
+            release_strategy_from_args(args)
         run_id = str(uuid.uuid4())
         run_target = prepare_test_run_destination(args.run_file, run_id)
         source_kind = "local" if args.action == "test-deploy-local" else "sandbox-handoff"
@@ -3155,6 +3236,7 @@ def main():
             )
         source = load_source_handoff(args.handoff)
         build = normalized_manifest_build(source.get("source_manifest", {}), args.build)
+        build = apply_path_prefix_assertion(build, args.confirm_path_prefix_aware)
         runtime = load_json_object(args.runtime)
         site_id = selected_site_id(args.site_id)
         plan = plan_site_version(site_id, "SandboxExport", source.get("source_manifest"), build, runtime)
