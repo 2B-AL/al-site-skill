@@ -58,7 +58,7 @@ class SiteClientTest(unittest.TestCase):
             self.assertFalse(stderr.write.called)
         with mock.patch("sys.stderr") as stderr:
             al_site.warn_tool_effect("GetSiteObservabilityLink")
-            self.assertIn("issues a short-lived authorization artifact", "".join(call.args[0] for call in stderr.write.call_args_list))
+            self.assertIn("lifecycle-stable or expiring", "".join(call.args[0] for call in stderr.write.call_args_list))
         with mock.patch("sys.stderr") as stderr:
             al_site.warn_tool_effect("DeploySiteVersion")
             self.assertIn("may mutate Site resources", "".join(call.args[0] for call in stderr.write.call_args_list))
@@ -432,6 +432,42 @@ class SiteClientTest(unittest.TestCase):
         args = parser.parse_args(["test-release-matrix", "/missing/project", "--confirm"])
         with mock.patch.object(al_site, "require_tools"), self.assertRaisesRegex(SystemExit, "does not exist"):
             al_site.preflight_release_matrix(args)
+
+    def test_release_matrix_requires_explicit_path_prefix_contract_before_mutation(self):
+        parser = al_site.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "Dockerfile").write_text("FROM scratch\nUSER 65532\n", encoding="utf-8")
+            args = parser.parse_args(["test-release-matrix", directory, "--confirm"])
+            with mock.patch.object(al_site, "require_tools"), self.assertRaisesRegex(SystemExit, "confirm-path-prefix-aware"):
+                al_site.preflight_release_matrix(args)
+
+    def test_release_matrix_applies_explicit_path_prefix_contract(self):
+        parser = al_site.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "Dockerfile").write_text("FROM scratch\nUSER 65532\n", encoding="utf-8")
+            args = parser.parse_args([
+                "test-release-matrix", directory, "--confirm", "--confirm-path-prefix-aware",
+            ])
+            with mock.patch.object(al_site, "require_tools"):
+                al_site.preflight_release_matrix(args)
+            self.assertTrue(json.loads(args.build)["path_prefix_aware"])
+
+    def test_call_tool_preserves_structured_error_metadata(self):
+        result = {
+            "isError": True,
+            "content": [{"type": "text", "text": "resource was not found"}],
+            "_meta": {
+                "error_code": "NotFound", "request_id": "req-1", "retryable": False,
+                "service": "al-site-manager", "upstream_status": 404,
+            },
+        }
+        with mock.patch.object(al_site, "call_tool_result", return_value=result), self.assertRaises(SystemExit) as raised:
+            al_site.call_tool("GetSiteObservabilityLink", {"site_id": "missing"})
+        payload = json.loads(str(raised.exception))
+        self.assertEqual("NotFound", payload["code"])
+        self.assertEqual("req-1", payload["request_id"])
+        self.assertEqual("al-site-manager", payload["service"])
+        self.assertEqual(404, payload["upstream_status"])
 
     def test_release_matrix_rolls_back_to_a_historical_deployment(self):
         releases = [

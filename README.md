@@ -53,7 +53,7 @@ python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID \
 
 ```bash
 python3 scripts/al_mcp.py test-release-matrix . \
-  --confirm --confirm-public --cleanup
+  --confirm --confirm-public --confirm-path-prefix-aware --cleanup
 ```
 
 该命令只操作一个有 UID 记录的专用测试 Site，依次验证 Immediate、带 signed lane 的 Blue-Green、Canary、Promote、Rollback、当前弹性变更与每阶段公网探测。失败时保留 `0600` run manifest 供 `cleanup-test-run` 精确回收；只有完整通过且传入 `--cleanup` 时才自动删除测试 Site。
@@ -98,7 +98,7 @@ python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-br
 python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
 
-`observe` 会先通过 Site MCP 重新校验当前调用者对 Site 的访问关系，再返回绑定不可变 Site UID 的短期 AL OAuth Grafana 链接。不要手工拼 Grafana URL 或租户查询参数；看板不可用不会改变构建、发布、回滚或弹性状态。
+`observe` 会先通过 Site MCP 重新校验当前调用者对 Site 的访问关系，再请求 AL OAuth 保护的 Grafana 入口。调用方必须读取返回的 `stable`、`_meta.lifecycle_stable` 和 `expires_at`，不能预设链接 TTL；生命周期稳定入口不是数据面凭据，并会在每次打开时重新检查当前权限。不要手工拼 Grafana URL 或租户查询参数；看板不可用不会改变构建、发布、回滚或弹性状态。
 
 `scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。只读指标工具会在 MCP 层对明确标记为 retryable 的 VMP 429/502/503/504 做一次短退避重试；矩阵等待仍受原始总 deadline 约束，持续故障会返回最后的错误码、请求 ID 和读取 attempt，而不会推进发布。
 

@@ -82,7 +82,7 @@ Use `release-status DEPLOYMENT_ID --watch` for the product status view. It repor
 
 Read [references/release.md](references/release.md) before choosing Blue-Green, Canary, metric gates, or rollback behavior.
 
-For a bounded platform regression run, use `test-release-matrix PATH --confirm --confirm-public`. It creates one UID-tracked test Site and verifies Immediate, protected Blue-Green candidate, Promote, Canary, Rollback, current scaling, and public smoke checks. Add `--cleanup` only when the exact test Site should be deleted after success; on failure use the retained run manifest with `cleanup-test-run --confirm`.
+For a bounded platform regression run, use `test-release-matrix PATH --confirm --confirm-public --confirm-path-prefix-aware` after verifying that the application works below a non-root APIG path prefix. The assertion never rewrites source files. The command creates one UID-tracked test Site and verifies Immediate, protected Blue-Green candidate, Promote, Canary, Rollback, current scaling, and public smoke checks. Add `--cleanup` only when the exact test Site should be deleted after success; on failure use the retained run manifest with `cleanup-test-run --confirm`.
 
 ## Validate candidate lanes
 
@@ -130,7 +130,7 @@ python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-br
 python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
 
-`observe` first asks Site MCP to re-authorize the selected Site and then issues a short-lived AL OAuth protected Grafana link scoped to that immutable Site UID. This does not mutate the Site, but it is an authorization-artifact issuance side effect. Never construct Grafana URLs or tenant query parameters manually. Dashboard-link failure is diagnostic only and must not change build, release, rollback, or scaling state.
+`observe` first asks Site MCP to re-authorize the selected Site and then requests an AL OAuth protected Grafana launch URL. Inspect `stable`, `_meta.lifecycle_stable`, and `expires_at` instead of assuming a TTL: a lifecycle-stable locator is not a data-plane credential and revalidates current access whenever it is opened. This does not mutate the Site. Never construct Grafana URLs or tenant query parameters manually. Dashboard-link failure is diagnostic only and must not change build, release, rollback, or scaling state.
 
 `GetSiteScaling`, `GetSiteMetrics`, and `GetSiteUsage` are read-only and may consume one bounded MCP retry when the Manager explicitly reports a retryable observability 429/502/503/504. Workflow waits continue within their existing deadline after that budget is exhausted. Never extend this behavior to release, promotion, rollback, scaling apply, or any other mutating tool, and never turn unavailable metrics into a passing gate.
 

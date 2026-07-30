@@ -956,7 +956,7 @@ def result_text(result):
 def call_tool(name, arguments):
     result = call_tool_result(name, arguments)
     if isinstance(result, dict) and result.get("isError"):
-        raise SystemExit(result_text(result))
+        raise SystemExit(json.dumps(bounded_tool_error(result), ensure_ascii=False, sort_keys=True))
     return result
 
 
@@ -972,7 +972,7 @@ def warn_tool_effect(name):
         return
     if name in SITE_CREDENTIAL_ISSUING_TOOLS:
         print(
-            f"notice: {name} does not mutate Site resources, but it issues a short-lived authorization artifact",
+            f"notice: {name} does not mutate Site resources; the response declares whether its OAuth-protected launch URL is lifecycle-stable or expiring",
             file=sys.stderr,
         )
         return
@@ -997,6 +997,9 @@ def bounded_tool_error(result):
     return {
         "code": str(meta.get("error_code") or "Unknown"),
         "request_id": str(meta.get("request_id") or ""),
+        "retryable": bool(meta.get("retryable")),
+        "service": str(meta.get("service") or ""),
+        "upstream_status": meta.get("upstream_status", meta.get("status_code")),
         "read_attempts": meta.get("read_attempts"),
         "message": result_text(result),
     }
@@ -1026,7 +1029,7 @@ def doctor_report():
         "read_only": True,
         "checks": [],
         "side_effects": {
-            "observability_link": "issues a short-lived authorization link and is not called by doctor",
+            "observability_link": "requests an OAuth-protected launch URL and is not called by doctor; inspect stable/lifecycle_stable/expires_at in the response",
             "plans_and_queries": "read-only",
             "release_and_resource_tools": "mutating",
         },
@@ -1796,7 +1799,14 @@ def preflight_release_matrix(args):
     # Fail before creating the dedicated Site when the local source is unsafe,
     # oversized, or has an invalid build contract. save_local_source repeats
     # this check immediately before packaging to close the TOCTOU window.
-    args.build = json.dumps(normalized_local_build(args.path, args.build))
+    build = normalized_local_build(args.path, args.build)
+    build = apply_path_prefix_assertion(build, args.confirm_path_prefix_aware)
+    if build.get("path_prefix_aware") is not True:
+        raise SystemExit(
+            "test-release-matrix requires an explicit path-prefix-aware source contract before creating the test Site; "
+            "pass --confirm-path-prefix-aware only after verifying the application works below a non-root URL prefix"
+        )
+    args.build = json.dumps(build)
     create_source_manifest(args.path)
 
 
@@ -2661,7 +2671,7 @@ def build_parser():
     get = sub.add_parser("get")
     get.add_argument("site_id", nargs="?", default="")
     get.add_argument("--relation", choices=("created", "accessible"), default="created")
-    observe = sub.add_parser("observe", help="Open a short-lived AL OAuth protected dashboard for a Site")
+    observe = sub.add_parser("observe", help="Open an AL OAuth protected dashboard using the returned launch lifecycle metadata")
     observe.add_argument("site_id", nargs="?", default="")
     observe.add_argument("--dashboard", choices=("overview", "rollout"), default="overview")
     observe.add_argument("--time-range", choices=("15m", "1h", "6h", "24h", "7d", "30d"), default="1h")
@@ -2727,6 +2737,10 @@ def build_parser():
     release_matrix.add_argument("--confirm", action="store_true", help="Confirm test traffic, rollback, and scaling mutations")
     release_matrix.add_argument("--cleanup", action="store_true", help="Delete the exact UID-matched test Site after a successful matrix")
     release_matrix.add_argument("--build", default="{}")
+    release_matrix.add_argument(
+        "--confirm-path-prefix-aware", action="store_true",
+        help="Assert that the application works below the Site APIG path prefix; this never rewrites source files",
+    )
     release_matrix.add_argument("--runtime", default="{}")
     release_matrix.add_argument("--canary", default="10,50,100")
     release_matrix.add_argument("--step-duration", default="1s")
