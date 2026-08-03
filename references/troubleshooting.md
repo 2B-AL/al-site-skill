@@ -1,72 +1,72 @@
-# 排障
+# Troubleshooting
 
-## 结构化发布错误
+## Structured release errors
 
-发布排障优先运行：
+Start release troubleshooting with:
 
 ```bash
 python3 scripts/al_mcp.py release-status DEPLOYMENT_ID --watch
 ```
 
-只根据 `state`、`blockedBy[].code`、`gate` 和 `nextActions` 决策，不解析自由文本 Condition。常见处理：
+Make decisions only from `state`, `blockedBy[].code`, `gate`, and `nextActions`; do not parse free-form Condition text. Common responses:
 
-- `DeploymentPlanStale`：客户端只会对完全相同的可见意图重新 Plan 一次；再次失败则重新检查 active rollout。
-- `ManualApprovalRequired`：先用 signed/header lane 验证 candidate，再 `promote --confirm` 或 rollback。
-- `MetricSamplesInsufficient`：显示当前样本，继续等或产生预期流量；不要强制当作 pass。
-- `ObservabilityUnavailable`：stable 保持不变。只读指标工具会先执行一次有界重试；工作流等待在原有 deadline 内继续观察。持续失败时使用返回的 request ID 检查 VMP workspace、prometheus-agent、ServiceMonitor 和 Adapter readiness，不得使用旧指标或强制推进。
-- `RollbackBlockedByMigration`：数据库不会回滚；要求应用/迁移兼容性 review，使用 `failureAction=pause`。
-- `ScalingQuotaExceeded`：按 capability 的 quota/headroom 降低 candidate maxScale。
+- `DeploymentPlanStale`: the client replans the exact same visible intent only once. If that also fails, recheck the active rollout.
+- `ManualApprovalRequired`: validate the candidate through a signed or header lane, then use `promote --confirm` or rollback.
+- `MetricSamplesInsufficient`: display the current sample count, continue waiting or generate the intended traffic, and never force the result to pass.
+- `ObservabilityUnavailable`: keep stable unchanged. Read-only metric tools first perform one bounded retry, while workflow waits continue within the original deadline. If the failure persists, use the returned request ID to inspect the VMP workspace, prometheus-agent, ServiceMonitor, and Adapter readiness. Do not use stale metrics or force the release to advance.
+- `RollbackBlockedByMigration`: the database is not rolled back. Require an application and migration compatibility review and use `failureAction=pause`.
+- `ScalingQuotaExceeded`: reduce the candidate maxScale based on capability quota/headroom.
 
-## Candidate lane 没有命中
+## Candidate lane does not match
 
-`--wait-candidate` 要求公网响应 `X-AL-Site-Target: candidate`。如果失败，检查 Deployment 的 candidate、routing epoch 和 lanes 是否已出现在 `release-status`；不要直接请求 Knative 私有 URL。Header Lane 还要确认 Key 在 capability allowlist 且 Value 精确匹配。Signed Lane grant 只能消费一次，过期后重新 `open-lane`。
+`--wait-candidate` requires the public response header `X-AL-Site-Target: candidate`. If it fails, confirm that the Deployment candidate, routing epoch, and lanes appear in `release-status`; do not request a private Knative URL directly. For a Header Lane, also confirm that the Key is in the capability allowlist and the Value matches exactly. A Signed Lane grant can be consumed only once; run `open-lane` again after it expires.
 
-## Metrics configured 但 unavailable
+## Metrics are configured but unavailable
 
-`configured=true, available=false` 不是零流量。依次检查 Provider 的 VMP query output、Adapter VMP Secret、Adapter `/readyz`、prometheus-agent addon、ServiceMonitor label 和实际 series freshness。Skill/MCP 不允许提交任意 PromQL。
+`configured=true, available=false` does not mean zero traffic. Check, in order, the Provider's VMP query output, the Adapter VMP Secret, Adapter `/readyz`, the prometheus-agent add-on, ServiceMonitor labels, and actual series freshness. Skill/MCP must not submit arbitrary PromQL.
 
-## 切换 Site MCP Gateway
+## Switch the Site MCP Gateway
 
-当前 dev 已内置独立 Site MCP Gateway。只有使用其他环境或显式清空/覆盖配置时，才需要配置 Gateway：
+The current dev environment includes a dedicated Site MCP Gateway. Configure a Gateway only for another environment or when explicitly clearing or overriding configuration:
 
 ```bash
 python3 scripts/al_mcp.py configure --gateway-url https://<site-mcp-public-host>
 ```
 
-Site Access Gateway 和用户 Site URL 不能替代 MCP Gateway。
+The Site Access Gateway and a user Site URL cannot substitute for the MCP Gateway.
 
 ## OAuth login is not configured
 
-Gateway 已部署但 `oauthRedirectURI` 尚未设置，或 OAuth static client 未注册完全相同的回调。先读取真实 APIG 公网域名，再把：
+The Gateway is deployed, but `oauthRedirectURI` is unset or the OAuth static client does not register the exact same callback. Read the real public APIG domain first, then configure:
 
 ```text
 https://<site-mcp-public-host>/oauth/callback
 ```
 
-同时写入 Gateway 配置和 OAuth client。Ingress `spec.rules[].host` 仍只能使用占位 host，不能写这个真实域名。
+in both the Gateway and the OAuth client. The Ingress `spec.rules[].host` must still use only a placeholder host; never put this real domain there.
 
 ## conversation id is required
 
-脚本会自动生成。若需要固定：
+The script generates one automatically. To pin it explicitly:
 
 ```bash
 export AL_SITE_CONVERSATION_ID=<uuid>
 ```
 
-## 没有当前 Site
+## No current Site is selected
 
 ```bash
 python3 scripts/al_mcp.py sites
 python3 scripts/al_mcp.py select SITE_ID
 ```
 
-`archive` 后 Site 仍然存在，只是 conversation 不再选择它。
+After `archive`, the Site still exists; the conversation simply no longer selects it.
 
 ## local Git working tree is not clean
 
-`save-local-git` 和 `deploy-local-git` 只接受不可变 commit。提交或移除 tracked/untracked 改动后重试。不要用忽略检查的方式发布与 commit 不一致的内容。
+`save-local-git` and `deploy-local-git` accept only an immutable commit. Commit or remove every tracked and untracked change, then retry. Do not bypass the check to publish content that differs from the commit.
 
-如果目标就是发布当前工作区内容，改用：
+If the goal is to publish the current working tree contents, use:
 
 ```bash
 python3 scripts/al_mcp.py save-local . --site-id SITE_ID
@@ -74,53 +74,53 @@ python3 scripts/al_mcp.py save-local . --site-id SITE_ID
 
 ## high-confidence credential material detected
 
-源目录包含疑似 private key、AWS key、GitHub token 或 Slack token。删除该文件，或在确实不属于 Site 构建输入时加入 `.alignore`。平台 denylist 下的凭据目录无需手工配置，且不能被重新包含。
+The source directory contains a suspected private key, AWS key, GitHub token, or Slack token. Remove the file, or add it to `.alignore` only when it is genuinely outside the Site build input. Platform-denied credential directories require no manual configuration and cannot be re-included.
 
 ## source archive exceeds the configured upload limit
 
-先用 `.alignore` 排除依赖缓存、构建产物和大文件。客户端默认与服务端均按 256 MiB 压缩传输上限处理；不要通过把 archive 塞入 MCP JSON 绕过限制。
+Use `.alignore` to exclude dependency caches, build outputs, and large files. Both the client and server default to a 256 MiB compressed transfer limit. Do not bypass it by putting an archive into MCP JSON.
 
 ## source upload part failed after retries
 
-检查本机是否可访问响应中的 TOS 区域端点，然后直接重跑同一个 `save-local` / `deploy-local` 命令。Skill 会从 `~/.al-site-mcp/uploads/<archive-sha256>.json` 恢复 caller-bound session，向服务端查询已完成 part，并只重传缺失分片。不要复制或打印 presigned URL。
+Confirm that the local machine can reach the TOS regional endpoint in the response, then rerun the same `save-local` or `deploy-local` command. The skill resumes the caller-bound session from `~/.al-site-mcp/uploads/<archive-sha256>.json`, queries the server for completed parts, and retransmits only missing parts. Never copy or print a presigned URL.
 
-若 session 已过期，Skill 会丢弃本地续传记录并创建新 session；旧 TOS multipart 由平台 staging GC 回收。
+If the session expired, the skill discards the local resume record and creates a new session. Platform staging GC collects the old TOS multipart upload.
 
 ## remote branch does not point at local HEAD
 
-先 push 当前 commit，再重试。Skill 不会自动 push，也不会把本地 Git credential 隐式传入 Site。
+Push the current commit, then retry. The skill does not push automatically and does not implicitly pass local Git credentials to Site.
 
 ## GitCommitNotFound
 
-常见原因：commit 未 push、repository URL 只在本机可达、私有仓库没有 importer credential、SSH 缺少固定 `knownHosts`，或 Site 构建网络无法访问远端。
+Common causes include an unpushed commit, a repository URL reachable only from the local machine, missing importer credentials for a private repository, SSH without fixed `knownHosts`, or a remote repository unreachable from the Site build network.
 
 ## DockerfileNotFound
 
-`build.dockerfile` 是相对于 `build.context`，不是相对于 SourceBundle 根目录重复计算。例如源码是 `app/Dockerfile`：
+Interpret `build.dockerfile` relative to `build.context`, not relative to the SourceBundle root a second time. For source at `app/Dockerfile`, use:
 
 ```json
 {"mode":"dockerfile","context":"app","dockerfile":"Dockerfile"}
 ```
 
-若同时配置 `context=app` 和 `dockerfile=app/Dockerfile`，Build Executor 会查找 `app/app/Dockerfile`。现在所有强类型保存命令都会先调用 `PlanSiteVersion`；带 handoff/local manifest 的来源会在创建不可变版本前返回解析后的缺失路径。
+If both `context=app` and `dockerfile=app/Dockerfile` are configured, Build Executor looks for `app/app/Dockerfile`. Every strongly typed save command now calls `PlanSiteVersion` first. For sources with a handoff or local manifest, the plan returns the resolved missing path before creating an immutable Version.
 
 ## image has non-numeric user
 
-Preview Pod 出现以下错误时：
+When a Preview Pod reports:
 
 ```text
 container has runAsNonRoot and image has non-numeric user (nonroot), cannot verify user is non-root
 ```
 
-将 Dockerfile 最终阶段从命名用户改成数字非 root UID/GID，例如：
+Change the final Dockerfile stage from a named user to a numeric non-root UID/GID, for example:
 
 ```dockerfile
 USER 65532:65532
 ```
 
-不要放宽 Site 的 `runAsNonRoot`。客户端 lint 会提前拒绝最终阶段中显式的命名 `USER` 或 UID 0；平台还会在 Preview 前检查最终 OCI config、入口 mode/owner、架构和 ELF interpreter，并返回精确的 runtime contract 错误。
+Do not relax Site `runAsNonRoot`. Client lint rejects an explicit named `USER` or UID 0 in the final stage. Before Preview, the platform also validates the final OCI configuration, entry-point mode and owner, architecture, and ELF interpreter, returning an exact runtime contract error.
 
-## 版本或部署一直未 Ready
+## A Version or Deployment never becomes Ready
 
 ```bash
 python3 scripts/al_mcp.py wait-version VERSION_ID --site-id SITE_ID
@@ -130,15 +130,12 @@ python3 scripts/al_mcp.py get-site-events --arg site_id=SITE_ID
 python3 scripts/al_mcp.py deployment DEPLOYMENT_ID --site-id SITE_ID
 ```
 
-`wait-version` 使用带 cursor 的长轮询；即使没有状态变化也会周期性返回 heartbeat，而不是让 Agent 盲等。失败时使用 owner-scoped 的 `GetSiteVersionLogs`，不接受调用方提供 namespace/Pod/container。以返回的 `phase`、stage、attempt、conditions、错误 code 和真实 URL 为准，不用 Pod Ready 或客户端 HTTP timeout 代替业务状态。
+`wait-version` uses cursor-based long polling. Even without state changes, it returns periodic heartbeats instead of leaving the Agent to wait blindly. On failure, use the owner-scoped `GetSiteVersionLogs`, which does not accept a caller-provided namespace, Pod, or container. Rely on the returned `phase`, stage, attempt, conditions, error code, and real URL. Do not substitute Pod readiness or a client HTTP timeout for product state.
 
-当 `build.errorClass=Transient` 且源码已经固化时，先查看
-`build.diagnosticCode` 和 `build.retryAt`。自动重试会等待持久化的退避门禁；
-预算耗尽后，只有在用户明确确认时执行：
+When `build.errorClass=Transient` and the source is already immutable, inspect `build.diagnosticCode` and `build.retryAt`. Automatic retries wait for the persisted backoff gate. After the budget is exhausted, run this only with explicit user confirmation:
 
 ```bash
 python3 scripts/al_mcp.py retry-version VERSION_ID --site-id SITE_ID --confirm --wait
 ```
 
-不要对 `PolicyDenied`、`InvalidInput`、漏洞扫描、runtime contract 或
-preview 失败使用构建重试；不要用创建多个新版本的方式放大同一个瞬态故障。
+Do not use build retry for `PolicyDenied`, `InvalidInput`, vulnerability scan, runtime contract, or preview failures. Do not amplify the same transient failure by creating multiple new Versions.

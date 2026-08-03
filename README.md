@@ -1,8 +1,10 @@
 # al-site-skill
 
-`al-site` 是一个纯 Site MCP 客户端 Skill。它通过 `scripts/al_mcp.py` 使用公网 Site MCP Gateway，不安装 MCP Server，也不依赖 Kubernetes、Knative、VMP 或 `al-sandbox`。同一个 Skill 覆盖源码保存、不可变版本、完整发布策略、灰度验收、回滚、指标和弹性。
+[Chinese](README.zh-CN.md)
 
-## 快速开始
+`al-site` is a pure Site MCP client skill. It uses the public Site MCP Gateway through `scripts/al_mcp.py`; it does not install an MCP Server and does not depend on Kubernetes, Knative, VMP, or `al-sandbox`. One skill covers source capture, immutable versions, complete release policies, staged acceptance, rollback, metrics, and scaling.
+
+## Quick start
 
 ```bash
 python3 scripts/al_mcp.py tools --names
@@ -12,12 +14,12 @@ python3 scripts/al_mcp.py create "My Site"
 python3 scripts/al_mcp.py deploy-local . --site-id SITE_ID --immediate
 ```
 
-首次调用会通过 Gateway `/login` 完成 OAuth Authorization Code + PKCE，并在本机缓存短期 token。默认 dev Gateway 可通过 `configure --gateway-url` 或 `AL_SITE_MCP_GATEWAY_URL` 覆盖。Site Access Gateway、用户 Site URL 和 APIG Ingress 占位 host 都不能代替 MCP Gateway。
+On the first call, the Gateway completes OAuth Authorization Code + PKCE through `/login` and caches a short-lived token locally. Override the default dev Gateway with `configure --gateway-url` or `AL_SITE_MCP_GATEWAY_URL`. The Site Access Gateway, a user Site URL, and an APIG Ingress placeholder host cannot substitute for the MCP Gateway.
 
-## 版本与发布
+## Versions and releases
 
 ```bash
-# 版本历史与差异
+# Version history and comparison
 python3 scripts/al_mcp.py versions --site-id SITE_ID
 python3 scripts/al_mcp.py version-diff VERSION_A VERSION_B --site-id SITE_ID
 python3 scripts/al_mcp.py retry-version VERSION_ID --site-id SITE_ID --confirm --wait
@@ -26,39 +28,39 @@ python3 scripts/al_mcp.py delete-version VERSION_ID --site-id SITE_ID --confirm
 # Immediate
 python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID --immediate --wait
 
-# Blue-Green：候选 0%，真实公网 signed-lane 验收后再 Promote
+# Blue-Green: keep the candidate at 0%, validate through a real public signed lane, then Promote
 python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID \
   --blue-green --wait-candidate
 python3 scripts/al_mcp.py promote DEPLOYMENT_ID --site-id SITE_ID --confirm
 
-# Canary：5% -> 25% -> 100%，用 VMP 指标自动判定
+# Canary: 5% -> 25% -> 100%, evaluated automatically with VMP metrics
 python3 scripts/al_mcp.py release VERSION_ID --site-id SITE_ID \
   --canary 5,25,100 --step-duration 5m \
   --min-requests 100 --max-error-rate 0.01 \
   --max-p95-ms 1000 --failure-action rollback --wait
 ```
 
-所有生产流量变化都先调用 `PlanSiteDeployment`，再携带短期 `plan_revision` 创建不可变 SiteDeployment。`deploy-local`、`deploy-local-git`、`test-deploy-local`、`test-deploy-current` 和 `release` 共用同一套 release options，不再有绕过 Plan 的 Immediate 快捷路径。
+Every production traffic change first calls `PlanSiteDeployment`, then creates an immutable SiteDeployment with a short-lived `plan_revision`. `deploy-local`, `deploy-local-git`, `test-deploy-local`, `test-deploy-current`, and `release` all use the same release options. There is no separate Immediate shortcut that bypasses Plan.
 
-远程 Git 的客户端无法读取提交内容。静态项目在 path 路由环境中必须由调用方显式确认前缀兼容，不能由客户端猜测：
+The client cannot inspect the contents of a remote Git commit. In a path-routed environment, the caller must explicitly assert prefix compatibility for a static project; the client must not guess:
 
 ```bash
 python3 scripts/al_mcp.py save-git REPOSITORY COMMIT_SHA --site-id SITE_ID \
   --build '{"mode":"static"}' --confirm-path-prefix-aware
 ```
 
-`--confirm-path-prefix-aware` 是源码契约断言，不会重写 HTML/CSS/JS；若不能确认，请省略该参数并让 `PlanSiteVersion` fail closed。
+`--confirm-path-prefix-aware` is a source-contract assertion and does not rewrite HTML, CSS, or JavaScript. If you cannot confirm the contract, omit the flag and let `PlanSiteVersion` fail closed.
 
-## 自动发布矩阵
+## Automated release matrix
 
 ```bash
 python3 scripts/al_mcp.py test-release-matrix . \
   --confirm --confirm-public --confirm-path-prefix-aware --cleanup
 ```
 
-该命令只操作一个有 UID 记录的专用测试 Site，依次验证 Immediate、带 signed lane 的 Blue-Green、Canary、Promote、Rollback、当前弹性变更与每阶段公网探测。失败时保留 `0600` run manifest 供 `cleanup-test-run` 精确回收；只有完整通过且传入 `--cleanup` 时才自动删除测试 Site。
+This command operates only on a dedicated test Site with a recorded UID. It validates Immediate, Blue-Green with a signed lane, Canary, Promote, Rollback, current scaling changes, and public probes at every stage. On failure, it retains a mode `0600` run manifest for exact recovery with `cleanup-test-run`. It deletes the test Site automatically only after complete success and only when `--cleanup` is supplied.
 
-## Header 与 Signed Lane
+## Headers and signed lanes
 
 ```bash
 python3 scripts/al_mcp.py release VERSION_ID --blue-green \
@@ -69,23 +71,23 @@ python3 scripts/al_mcp.py release VERSION_ID --canary 5,25,100 \
   --lane-header X-AL-Site-Lane=beta --wait-candidate
 ```
 
-Header Key 必须来自平台 capability allowlist，Value 由每次发布指定并做 exact match。Public Header 只是路由条件，不是认证。Signed Lane 使用一次性 fragment grant 换取 HttpOnly Cookie。`--wait-candidate` 会通过真实 Site 公网 URL 请求，并验证 Gateway 返回 `X-AL-Site-Target: candidate`。
+The Header Key must come from the platform capability allowlist. Each release supplies a Value that is matched exactly. A public header is only a routing condition, not authentication. A signed lane exchanges a one-time fragment grant for an HttpOnly cookie. `--wait-candidate` sends a request through the real public Site URL and verifies that the Gateway returns `X-AL-Site-Target: candidate`.
 
-## 发布动作与回滚
+## Release actions and rollback
 
 ```bash
 python3 scripts/al_mcp.py release-status DEPLOYMENT_ID --watch
 python3 scripts/al_mcp.py pause DEPLOYMENT_ID
 python3 scripts/al_mcp.py resume DEPLOYMENT_ID
-# 如果暂停期间原 step timeout 已经过期，必须明确延长或改为 rollback
+# If the original step timeout elapsed during the pause, explicitly extend it or choose rollback
 python3 scripts/al_mcp.py resume DEPLOYMENT_ID --extend-timeout 10m
 python3 scripts/al_mcp.py cancel DEPLOYMENT_ID --confirm
 python3 scripts/al_mcp.py rollback HISTORICAL_DEPLOYMENT_ID --confirm --wait
 ```
 
-客户端会先读取最新 step、phase、routing epoch、UID 和 resource version。Rollback 会先返回当前/目标差异、历史 Revision 和 migration 风险，再创建新的不可变 Deployment；数据库和 Add-on 数据永远不会随应用流量回滚。
+Before acting, the client reads the latest step, phase, routing epoch, UID, and resource version. Rollback first displays the current/target differences, historical Revision, and migration risk, then creates a new immutable Deployment. Database and Add-on data are never rolled back with application traffic.
 
-## 弹性
+## Scaling
 
 ```bash
 python3 scripts/al_mcp.py scaling-status
@@ -98,23 +100,23 @@ python3 scripts/al_mcp.py observe --dashboard overview --time-range 1h --open-br
 python3 scripts/al_mcp.py observe --dashboard rollout --time-range 6h
 ```
 
-`observe` 会先通过 Site MCP 重新校验当前调用者对 Site 的访问关系，再请求 AL OAuth 保护的 Grafana 入口。调用方必须读取返回的 `stable`、`_meta.lifecycle_stable` 和 `expires_at`，不能预设链接 TTL；生命周期稳定入口不是数据面凭据，并会在每次打开时重新检查当前权限。不要手工拼 Grafana URL 或租户查询参数；看板不可用不会改变构建、发布、回滚或弹性状态。
+`observe` first asks Site MCP to revalidate the current caller's access relation to the Site, then requests an AL OAuth-protected Grafana entry point. Read `stable`, `_meta.lifecycle_stable`, and `expires_at` from the response instead of assuming a link TTL. A lifecycle-stable entry point is not a data-plane credential and rechecks current permissions whenever it is opened. Never construct a Grafana URL or tenant query parameters manually. Dashboard unavailability does not change build, release, rollback, or scaling state.
 
-`scaling-set-defaults` 只影响未来默认值；`scaling-apply` 会为当前 active Version 做 Plan，并创建新的不可变 Deployment。指标返回明确区分 `configured` 和 `available`，不会把缺失 VMP 数据伪装成零。只读指标工具会在 MCP 层对明确标记为 retryable 的 VMP 429/502/503/504 做一次短退避重试；矩阵等待仍受原始总 deadline 约束，持续故障会返回最后的错误码、请求 ID 和读取 attempt，而不会推进发布。
+`scaling-set-defaults` affects only future defaults. `scaling-apply` plans against the current active Version and creates a new immutable Deployment. Metric responses distinguish `configured` from `available` and never fabricate missing VMP data as zero. Read-only metric tools retry once with a short backoff only when MCP explicitly classifies a VMP 429/502/503/504 as retryable. Matrix waits remain within the original overall deadline. A persistent failure returns the final error code, request ID, and read attempt without advancing the release.
 
-## 独立与组合使用
+## Independent and combined use
 
-- 独立 Site：`save-local`、`save-git`、`save-oci` 和全部发布/弹性命令不依赖 Sandbox。
-- 独立 Sandbox：`al-sandbox` 不依赖 Site。
-- 组合模式：`al-sandbox handoff` 生成一次性 owner-bound 描述符，`save-current --handoff @file` 精确消费项目 SourceBundle。两个 Skill 的 token、conversation 和 state 互不读取。
+- Standalone Site: `save-local`, `save-git`, `save-oci`, and every release or scaling command operate without Sandbox.
+- Standalone Sandbox: `al-sandbox` operates without Site.
+- Combined mode: `al-sandbox handoff` creates a one-time owner-bound descriptor, and `save-current --handoff @file` consumes the exact project SourceBundle. The two skills never read each other's token, conversation, or state.
 
-## 安全与状态
+## Safety and state
 
-- `tools/list` 和在线 capability 是唯一运行时契约。
-- SiteVersion/SiteDeployment 不可变；不要修改历史模拟更新。
-- public、100% promote、rollback、lane revoke、当前弹性变化和删除需要明确意图。
-- 自动回滚遇到未声明向后兼容的 migration 会暂停，不会冒险切回旧应用。
-- `archive` 只清除 conversation 选择，不删除 Site。
-- 需要人工动作的 Paused 以 JSON 输出并使用退出码 `3`；失败使用其他非零退出码。
+- Treat `tools/list` and online capabilities as the only runtime contract.
+- Treat SiteVersion and SiteDeployment as immutable. Do not modify history to simulate an update.
+- Require explicit intent for public access, 100% promotion, rollback, lane revocation, current scaling changes, and deletion.
+- Pause automatic rollback for a migration unless backward compatibility was explicitly declared; do not risk switching traffic back to the old application.
+- `archive` clears only the conversation selection and does not delete a Site.
+- Print a Paused state requiring manual action as JSON and exit with code `3`; use another nonzero code for failure.
 
-完整 Agent 约定见 [SKILL.md](SKILL.md)。策略、Lane、弹性、版本与排障分别见 [references/release.md](references/release.md)、[references/lanes.md](references/lanes.md)、[references/scaling.md](references/scaling.md)、[references/versions.md](references/versions.md) 和 [references/troubleshooting.md](references/troubleshooting.md)。
+See [SKILL.md](SKILL.md) for the complete Agent instructions. See [references/release.md](references/release.md), [references/lanes.md](references/lanes.md), [references/scaling.md](references/scaling.md), [references/versions.md](references/versions.md), and [references/troubleshooting.md](references/troubleshooting.md) for release policy, lanes, scaling, versions, and troubleshooting.

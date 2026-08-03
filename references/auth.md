@@ -1,28 +1,28 @@
-# 认证
+# Authentication
 
-Site Skill 使用公网 `al-site-mcp-gateway` 完成登录：
+The Site Skill signs in through the public `al-site-mcp-gateway`:
 
-1. 脚本在 `http://127.0.0.1:8766/oauth/callback` 启动临时 loopback listener。
-2. 打开 Gateway `/login?redirect_after_login=...`。
-3. Gateway 作为 `al-site-mcp-gateway` public client 完成 OAuth Authorization Code + PKCE。
-4. Gateway 只允许把 token handoff 到安全的 loopback callback。
-5. 脚本将短期 token 缓存到 `~/.al-site-mcp/state.json`，文件权限为 `0600`。
+1. Start a temporary loopback listener at `http://127.0.0.1:8766/oauth/callback`.
+2. Open the Gateway at `/login?redirect_after_login=...`.
+3. Let the Gateway complete OAuth Authorization Code + PKCE as the `al-site-mcp-gateway` public client.
+4. Allow the Gateway to hand off the token only to a safe loopback callback.
+5. Cache the short-lived token in `~/.al-site-mcp/state.json` with mode `0600`.
 
-后续 MCP 请求使用：
+Subsequent MCP requests use:
 
 ```http
 Authorization: Bearer <AL access token>
 X-AL-Conversation-ID: <conversation id>
 ```
 
-Gateway 会校验 token，解析 user/org/app，清除外部伪造的内部身份 header，并使用独立内部 bearer 调用 `al-site-tools-mcp`。客户端不持有 delegated HMAC、Site Manager service credential 或 Kubernetes credential。
+The Gateway validates the token, resolves the user, organization, and application, removes externally forged internal identity headers, and calls `al-site-tools-mcp` with a separate internal bearer token. The client does not hold a delegated HMAC, a Site Manager service credential, or a Kubernetes credential.
 
-本地源码上传时，Gateway/MCP 只代理 caller-bound JSON 控制请求。脚本向 TOS 发出的请求只包含 Manager 返回的签名 header 和 `Content-Length`，不会携带上述 OAuth token、conversation id 或内部身份 header；presigned URL 也不会写入本地状态或错误输出。
+For local source uploads, the Gateway/MCP proxies only caller-bound JSON control requests. Requests sent by the script to TOS contain only the signed headers returned by the Manager and `Content-Length`; they never include the OAuth token, conversation ID, or internal identity headers described above. Presigned URLs are not written to local state or error output.
 
-可指定当前组织：
+To select the current organization:
 
 ```bash
 export AL_SITE_ORG_ID=<org-id>
 ```
 
-`logout` 只清除本地 access token；`archive` 只清除 conversation 的 Site 选择。两者都不会删除或停止 Site。
+`logout` clears only the local access token. `archive` clears only the Site selection for the conversation. Neither command deletes or stops a Site.

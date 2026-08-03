@@ -1,8 +1,8 @@
-# Site MCP 工具
+# Site MCP tools
 
-在线 `tools/list` 是权威契约。当前 Skill 预期并覆盖以下工具；每个工具既可通过 `call ToolName` 调用，也有自动生成的 kebab-case 命令。
+Treat the online `tools/list` response as the authoritative contract. The current skill expects and covers the tools below. Call each tool either with `call ToolName` or through its automatically generated kebab-case command.
 
-| 领域 | 工具 |
+| Area | Tools |
 | --- | --- |
 | Site | `CreateSite`, `SelectSite`, `GetCurrentSite`, `GetSite`, `ListSites`, `UpdateSite`, `DeleteSite` |
 | Capability/Plan | `GetSitePlatformCapabilities`, `PlanSiteVersion`, `PlanSiteDeployment`, `PlanSiteScaling` |
@@ -15,7 +15,7 @@
 | Add-on | `AttachSiteAddonBinding`, `DetachSiteAddonBinding` |
 | Conversation | `ArchiveConversationSite` |
 
-## 动态发现与通用调用
+## Dynamic discovery and generic calls
 
 ```bash
 python3 scripts/al_mcp.py tools --names
@@ -24,7 +24,7 @@ python3 scripts/al_mcp.py call PromoteSiteDeployment --arguments @promote.json
 python3 scripts/al_mcp.py promote-site-deployment --arguments @promote.json
 ```
 
-`--arguments` 必须是 JSON object。`--arg` 可重复并覆盖同名字段：
+`--arguments` must be a JSON object. Repeat `--arg` as needed; it overrides fields with the same name:
 
 ```bash
 python3 scripts/al_mcp.py set-site-access-policy \
@@ -33,38 +33,32 @@ python3 scripts/al_mcp.py set-site-access-policy \
   --arg 'users=["user-1"]'
 ```
 
-## 常用强类型入口
+## Common strongly typed commands
 
-| 命令 | MCP 工具 |
+| Command | MCP tool |
 | --- | --- |
 | `create` | `CreateSite` |
 | `select` | `SelectSite` |
 | `current` | `GetCurrentSite` |
-| `sites [--relation created\|accessible] [--owner-kind ...] [--phase ...]` | `ListSites`；默认只列出当前用户创建的 Site，并自动遍历分页 |
-| `get [SITE_ID] [--relation created\|accessible]` | `GetSite`；按同一关系做存在性断言 |
+| `sites [--relation created\|accessible] [--owner-kind ...] [--phase ...]` | `ListSites`; lists only Sites created by the current user by default and automatically traverses all pages |
+| `get [SITE_ID] [--relation created\|accessible]` | `GetSite`; asserts existence under the same relation |
 | `save-local` / `deploy-local` | Gateway binary upload + `SaveSiteVersion(source_bundle)` |
 | `save-current --handoff @file` | `PlanSiteVersion` + `SaveSiteVersion(sandbox_handoff)` |
-| `test-deploy-local` / `test-deploy-current` | 创建专用测试 Site，完成 plan/version/deployment/smoke，并写入精确资源清单 |
-| `cleanup-test-run RUN_FILE --confirm` | UID 复核后仅删除该清单创建的测试 Site 及其受控子资源 |
+| `test-deploy-local` / `test-deploy-current` | Create a dedicated test Site, complete plan/version/deployment/smoke, and write an exact resource manifest |
+| `cleanup-test-run RUN_FILE --confirm` | After UID verification, delete only the test Site and controlled child resources recorded in the manifest |
 | `save-git` / `save-local-git` | `SaveSiteVersion(git)` |
 | `save-oci` | `SaveSiteVersion(oci)` |
-| `version` / `versions` / `version-diff` / `wait-version` / `retry-version` / `delete-version` | immutable Version query, comparison, watch, bounded build retry, and preconditioned deletion |
-| `release-plan` / `release` / `deploy` | `PlanSiteDeployment` then `DeploySiteVersion(plan_revision)` |
-| `release-status` | structured `GetSiteReleaseStatus`; `--watch` exits 3 on actionable pause |
-| `open-lane` / `revoke-lane` | signed candidate session and epoch revocation |
-| `promote` / `pause` / `resume` / `cancel` / `rollback` | current-state protected release actions; rollback plans first |
-| `scaling-status` / `scaling-set-defaults` / `scaling-apply` | query, future defaults, or planned current-production change |
-| `deployment` / `deployments` / `wait-deployment` | `GetSiteDeployment` / `WatchSiteDeployment`; cursor 长轮询持续显示 smoke、traffic 和 gate 状态 |
+| `version` / `versions` / `version-diff` / `wait-version` / `retry-version` / `delete-version` | Immutable Version query, comparison, watch, bounded build retry, and preconditioned deletion |
+| `release-plan` / `release` / `deploy` | `PlanSiteDeployment`, then `DeploySiteVersion(plan_revision)` |
+| `release-status` | Structured `GetSiteReleaseStatus`; `--watch` exits with code 3 on an actionable pause |
+| `open-lane` / `revoke-lane` | Signed candidate session and epoch revocation |
+| `promote` / `pause` / `resume` / `cancel` / `rollback` | Current-state-protected release actions; rollback plans first |
+| `scaling-status` / `scaling-set-defaults` / `scaling-apply` | Query, future defaults, or a planned current-production change |
+| `deployment` / `deployments` / `wait-deployment` | `GetSiteDeployment` / `WatchSiteDeployment`; cursor-based long polling continues to display smoke, traffic, and gate state |
 | `archive` | Gateway conversation archive endpoint |
 
-高影响工具不要只依赖快捷入口；调用前使用 `describe` 确认在线 required fields、`resource_version` 和确认字段。
+For high-impact tools, do not rely only on a shortcut. Use `describe` first to confirm the online required fields, `resource_version`, and confirmation fields.
 
-`created` 依据 Site 中持久化的创建者身份，和可为 team/org 的 owner 分离；
-`accessible` 依据当前 user/team/org owner 成员关系，表示调用者拥有 MCP 控制面管理权限。
-public/selected audience、公网 URL 或应用侧访问认证属于数据面，不会授予控制面访问权限。
-两种查询都由服务端按认证身份过滤，客户端不在本地下载全集后筛选。
-查询统一返回 creator、owner、relations、permissions、status、UID、resource version、时间和 details。
-更新必须携带最新 `resource_version`；删除必须携带 `confirm=true`、最新 `expected_uid` 和
-`resource_version`，发生冲突时重新 Get 后再决定是否重试。
+`created` is based on the creator identity persisted in the Site and is distinct from the owner, which may be a team or organization. `accessible` is based on current user/team/org owner membership and means that the caller has MCP control-plane management permission. A public or selected audience, public URL, or application access authentication belongs to the data plane and does not grant control-plane access. The server filters both queries by authenticated identity; the client never downloads the full collection and filters it locally. Query results consistently include creator, owner, relations, permissions, status, UID, resource version, time, and details. An update must include the latest `resource_version`. A deletion must include `confirm=true`, the latest `expected_uid`, and `resource_version`. On conflict, run Get again before deciding whether to retry.
 
-`GetSitePlatformCapabilities` 决定当前路由模式允许的 audience、release strategy、lane、metric gate、scaling profile 和 readiness。客户端必须在创建资源前拒绝不支持的组合，尤其不能把显式 `owner` 静默改成 `public`。`PlanSiteVersion` 是源码 preflight，`PlanSiteDeployment` 是所有生产流量变化的强制 preflight；没有 plan 能力时，强类型发布命令 fail closed。
+`GetSitePlatformCapabilities` determines the audience, release strategy, lane, metric gate, scaling profile, and readiness supported by the current routing mode. The client must reject unsupported combinations before resource creation. In particular, it must never silently change an explicit `owner` audience to `public`. `PlanSiteVersion` is the source preflight. `PlanSiteDeployment` is the mandatory preflight for every production traffic change. When Plan is unavailable, strongly typed release commands must fail closed.
